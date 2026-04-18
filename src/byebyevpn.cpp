@@ -113,7 +113,7 @@ static void banner() {
     puts("|____/ \\__, |\\___|____/ \\__, |\\___| \\_/  |_|   |_| \\_|");
     puts("       |___/            |___/                          ");
     printf("%s", col(C::RST));
-    printf("%s  Full TSPU/DPI/VPN detectability scanner  v2.1%s\n\n",
+    printf("%s  Full TSPU/DPI/VPN detectability scanner  v2.2%s\n\n",
            col(C::DIM), col(C::RST));
 }
 
@@ -882,7 +882,33 @@ struct TlsProbe {
     string cert_sha256;
     vector<string> san;
     int64_t handshake_ms = 0;
+    // v2.2 — richer cert intel for red-flag accumulation
+    string  subject_cn;      // CN only (for short display)
+    string  issuer_cn;       // issuer CN only
+    int     age_days = 0;    // today - notBefore  (negative if not yet valid)
+    int     days_left = 0;   // notAfter - today   (negative if expired)
+    int     total_validity_days = 0;
+    bool    self_signed = false;
+    bool    is_letsencrypt = false;  // LE / ZeroSSL / Buypass — free-CA family
+    bool    is_wildcard = false;     // any *.foo in SAN or CN
+    int     san_count = 0;
 };
+
+static int asn1_time_diff_days_now(const ASN1_TIME* t, bool from_t_to_now) {
+    if (!t) return 0;
+    int day = 0, sec = 0;
+    if (from_t_to_now) ASN1_TIME_diff(&day, &sec, t, nullptr);
+    else               ASN1_TIME_diff(&day, &sec, nullptr, t);
+    return day;
+}
+
+static string extract_cn_from_subject(const string& subj) {
+    size_t p = subj.find("CN=");
+    if (p == string::npos) return {};
+    p += 3;
+    size_t e = subj.find_first_of("/,", p);
+    return subj.substr(p, e == string::npos ? string::npos : e - p);
+}
 
 static string x509_name_one(X509_NAME* n) {
     char b[512]={0};
@@ -931,9 +957,32 @@ static TlsProbe tls_probe(const string& ip, int port, const string& sni,
     if (cert) {
         r.cert_subject = x509_name_one(X509_get_subject_name(cert));
         r.cert_issuer  = x509_name_one(X509_get_issuer_name(cert));
+        r.subject_cn   = extract_cn_from_subject(r.cert_subject);
+        r.issuer_cn    = extract_cn_from_subject(r.cert_issuer);
+        r.self_signed  = !r.cert_subject.empty() && r.cert_subject == r.cert_issuer;
+        // free-CA family commonly used by disposable proxy hosts
+        {
+            const string& iss = r.cert_issuer;
+            r.is_letsencrypt =
+                iss.find("Let's Encrypt") != string::npos ||
+                iss.find("R3") != string::npos || iss.find("R10") != string::npos ||
+                iss.find("R11") != string::npos || iss.find("E5") != string::npos ||
+                iss.find("E6") != string::npos ||
+                iss.find("ZeroSSL") != string::npos ||
+                iss.find("Buypass") != string::npos ||
+                iss.find("Google Trust Services") != string::npos;
+        }
         unsigned char dgst[32]; unsigned dl = 0;
         X509_digest(cert, EVP_sha256(), dgst, &dl);
         r.cert_sha256 = hex_s(dgst, dl);
+        // cert validity
+        const ASN1_TIME* nb = X509_get0_notBefore(cert);
+        const ASN1_TIME* na = X509_get0_notAfter(cert);
+        r.age_days  = asn1_time_diff_days_now(nb, true);    // nb -> now
+        r.days_left = asn1_time_diff_days_now(na, false);   // now -> na
+        if (nb && na) {
+            int d=0, s=0; ASN1_TIME_diff(&d, &s, nb, na); r.total_validity_days = d;
+        }
         GENERAL_NAMES* gens = (GENERAL_NAMES*)X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr);
         if (gens) {
             int nn = sk_GENERAL_NAME_num(gens);
@@ -942,12 +991,19 @@ static TlsProbe tls_probe(const string& ip, int port, const string& sni,
                 if (g->type == GEN_DNS) {
                     unsigned char* us = nullptr;
                     int ul = ASN1_STRING_to_UTF8(&us, g->d.dNSName);
-                    if (ul > 0) r.san.push_back(string((char*)us, ul));
+                    if (ul > 0) {
+                        string name((char*)us, ul);
+                        if (name.size() > 2 && name[0]=='*' && name[1]=='.') r.is_wildcard = true;
+                        r.san.push_back(std::move(name));
+                    }
                     OPENSSL_free(us);
                 }
             }
             GENERAL_NAMES_free(gens);
         }
+        r.san_count = (int)r.san.size();
+        if (!r.is_wildcard && !r.subject_cn.empty() && r.subject_cn.size() > 2 &&
+            r.subject_cn[0] == '*' && r.subject_cn[1] == '.') r.is_wildcard = true;
         X509_free(cert);
     }
     SSL_shutdown(ssl);
@@ -1806,10 +1862,20 @@ static FullReport run_full_target(const string& target) {
             TlsProbe tp = tls_probe(R.dns.primary_ip, o.port, R.dns.host);
             if (tp.ok) {
                 FpResult f; f.service = "TLS";
+                char agebuf[96] = {0};
+                snprintf(agebuf, sizeof(agebuf), "age=%dd left=%dd",
+                         tp.age_days, tp.days_left);
                 f.details = tp.version + " / " + tp.cipher + " / ALPN=" +
                             (tp.alpn.empty()?"-":tp.alpn) + " / " + tp.group +
                             " / " + std::to_string(tp.handshake_ms) + "ms" +
-                            " | cert: " + printable_prefix(tp.cert_subject, 70);
+                            "\n                       cert CN=" +
+                            (tp.subject_cn.empty() ? "(none)" : tp.subject_cn) +
+                            "  issuer=" + (tp.issuer_cn.empty() ? "(none)" : tp.issuer_cn) +
+                            "  " + agebuf +
+                            "  SAN=" + std::to_string(tp.san_count) +
+                            (tp.is_wildcard  ? " wildcard" : "") +
+                            (tp.self_signed  ? " self-signed" : "") +
+                            (tp.is_letsencrypt ? " [free-CA]" : "");
                 line(f);
                 pf.tls = tp;
                 // SNI consistency
@@ -1906,138 +1972,256 @@ static FullReport run_full_target(const string& target) {
                col(C::MAG), verdict, col(C::RST), silent, resp);
     }
 
-    // 7) Verdict engine
+    // 7) Verdict engine (v2.2 — accumulative red-flag model)
     //
-    // Design goal: never upgrade a weak soft-signal ("silent on junk") into
-    // a positive stack identification. A stack is only named when a strong
-    // protocol-level signature is present (e.g. Reality cert-steering +
-    // TLS handshake, OpenVPN wire protocol on UDP, WireGuard default port
-    // answering its handshake, etc.).
-    //
-    // Scoring semantics:
-    //   100 = no protocol-level VPN/proxy signature found
-    //    <  = penalties for every identifying pattern (VPN-flag in GeoIP,
-    //         exposed proxy, plaintext VPN, weak TLS, etc.)
-    //   Reality adds *penalties* too — being cleanly identifiable as
-    //   Reality still counts as detectable, just not as hard as plaintext
-    //   OpenVPN/WireGuard.
+    // Rules:
+    //   * A "stack" is only named on strong protocol-level evidence:
+    //     Reality cert-steering + TLS, OpenVPN wire protocol on UDP,
+    //     WireGuard default port answering a real handshake, etc.
+    //   * Every soft signal (hosting-ASN, fresh cert, single open port,
+    //     free-CA issuer, SSH on 22, weak TLS, SNI-anomaly, etc.) adds a
+    //     red flag. Red flags do not rename the stack but cumulatively
+    //     push the score down.
+    //   * 3+ independent red flags trigger a COMBO penalty — the pattern
+    //     as a whole starts to look like a single-purpose proxy host even
+    //     if no single signal is conclusive.
+    //   * A dedicated DPI exposure matrix at the end shows exactly by
+    //     which axis the host can be classified.
     // ------------------------------------------------------------------
     printf("\n%s[7/7] Verdict%s\n", col(C::BOLD), col(C::RST));
     int score = 100;
-    vector<string> stack;
+    vector<string> signals_major;  // strong: named VPN protocol, proxy,
+                                   // Tor exit, VPN-flagged by multiple
+                                   // sources
+    vector<string> signals_minor;  // soft: hosting-ASN, fresh cert,
+                                   // sparse open-port profile, free-CA,
+                                   // ALPN != h2, etc.
     vector<std::pair<int,string>> port_roles; // (port, role label)
+    vector<std::pair<string,string>> dpi_axes; // (axis, exposure-string)
     bool xray_reality_primary = false, xray_reality_hidden = false;
     int  reality_port_count   = 0;
 
-    // ---- GeoIP signals ----------------------------------------------
-    for (auto& g: R.geos) {
-        if (g.is_hosting) score -= 5;
-        if (g.is_vpn)     { score -= 15; stack.push_back("flagged as VPN by " + g.source); }
-        if (g.is_proxy)   { score -= 10; stack.push_back("flagged as proxy by " + g.source); }
-        if (g.is_tor)     { score -= 20; stack.push_back("flagged as Tor exit by " + g.source); }
-    }
-    if (R.geos.size() >= 2 && !R.geos[0].country_code.empty() && !R.geos[1].country_code.empty()
-        && R.geos[0].country_code != R.geos[1].country_code) {
-        score -= 5;
-        stack.push_back("country-code mismatch between GeoIP sources");
-    }
+    auto flag_minor = [&](const string& s, int penalty = 3) {
+        signals_minor.push_back(s);
+        score -= penalty;
+    };
+    auto flag_major = [&](const string& s, int penalty) {
+        signals_major.push_back(s);
+        score -= penalty;
+    };
 
-    // ---- TCP exposure signals ---------------------------------------
+    // ---- GeoIP signals ---------------------------------------------
+    int vpn_hits = 0, proxy_hits = 0, hosting_hits = 0, tor_hits = 0;
+    for (auto& g: R.geos) {
+        if (g.is_hosting) ++hosting_hits;
+        if (g.is_vpn)     ++vpn_hits;
+        if (g.is_proxy)   ++proxy_hits;
+        if (g.is_tor)     ++tor_hits;
+    }
+    if (tor_hits)
+        flag_major("flagged as Tor exit by " + std::to_string(tor_hits) + " GeoIP source(s)", 25);
+    if (vpn_hits >= 2)
+        flag_major("flagged as VPN by " + std::to_string(vpn_hits) + " GeoIP sources", 18);
+    else if (vpn_hits == 1)
+        flag_minor("flagged as VPN by 1 GeoIP source (weak — single-source)", 8);
+    if (proxy_hits >= 2)
+        flag_major("flagged as proxy by " + std::to_string(proxy_hits) + " GeoIP sources", 12);
+    else if (proxy_hits == 1)
+        flag_minor("flagged as proxy by 1 GeoIP source", 5);
+    if (hosting_hits >= 3)
+        flag_minor("hosting/datacenter ASN confirmed by " + std::to_string(hosting_hits) + " sources", 5);
+    else if (hosting_hits >= 1)
+        flag_minor("hosting/datacenter ASN (" + std::to_string(hosting_hits) + " source(s))", 3);
+    if (R.geos.size() >= 2 && !R.geos[0].country_code.empty() && !R.geos[1].country_code.empty()
+        && R.geos[0].country_code != R.geos[1].country_code)
+        flag_minor("country-code mismatch between GeoIP sources (geolocation inconsistency)", 3);
+
+    // ---- TCP exposure signals --------------------------------------
     set<int> openset;
     for (auto& o: R.open_tcp) openset.insert(o.port);
-    if (openset.count(22))   { score -= 5;  stack.push_back("SSH/22 exposed (ASN classifier marks host as VPS/server)"); }
-    if (openset.count(3389)) { score -= 10; stack.push_back("RDP/3389 exposed to Internet (attack surface)"); }
-    if (openset.count(80))   stack.push_back("HTTP/80 open (normal for a public web-front)");
-    if (openset.count(443))  stack.push_back("HTTPS/443 open (normal for a public web-front)");
+    if (openset.count(22))   flag_minor("SSH/22 exposed (ASN classifier marks host as VPS/server)", 5);
+    if (openset.count(3389)) flag_major("RDP/3389 exposed to Internet (attack surface + server profile)", 10);
     if (openset.count(1080) || openset.count(1081))
-        { stack.push_back("SOCKS5 exposed without wrapper"); score -= 15; }
-    if (openset.count(3128) || openset.count(8080) || openset.count(8118))
-        { stack.push_back("HTTP proxy exposed without wrapper"); score -= 10; }
-    if (openset.count(1194)) { stack.push_back("OpenVPN TCP/1194 (default OpenVPN port)"); score -= 15; }
+        flag_major("SOCKS5 exposed without wrapper (proxy signature)", 15);
+    if (openset.count(3128) || openset.count(8118))
+        flag_major("HTTP proxy exposed without wrapper", 12);
+    if (openset.count(1194))
+        flag_major("OpenVPN TCP/1194 default port open (hard protocol signature)", 15);
     if (openset.count(8388) || openset.count(8488))
-        { stack.push_back("Shadowsocks default port exposed"); score -= 15; }
+        flag_major("Shadowsocks default port exposed (instantly fingerprintable)", 15);
     if (openset.count(10808) || openset.count(10809) || openset.count(10810))
-        { stack.push_back("v2ray/xray local-style inbound port exposed to WAN"); score -= 10; }
+        flag_major("v2ray/xray local-style inbound port exposed to WAN (misconfig)", 12);
+    if (openset.count(500) || openset.count(4500))
+        flag_minor("IKE control ports open (500/4500) — IPsec/IKEv2 posture", 4);
+    if (openset.count(443) && R.open_tcp.size() == 1)
+        flag_minor("single open port profile: :443 only — common reverse-proxy / VLESS-Reality front", 5);
+    else if (openset.count(443) && R.open_tcp.size() <= 3 && hosting_hits)
+        flag_minor("sparse open-port profile (<=3 ports) on hosting ASN with :443 open — VPS-proxy profile", 4);
 
-    // ---- UDP handshake signals --------------------------------------
+    // ---- UDP handshake signals -------------------------------------
     for (auto& [p,u]: R.udp_probes) {
         if (!u.responded) continue;
-        if (p == 1194)  { stack.push_back("OpenVPN UDP/1194 reflects HARD_RESET (protocol-level match)"); score -= 20; }
-        if (p == 500)   { stack.push_back("IKEv2 responder on UDP/500"); score -= 5; }
-        if (p == 4500)  { stack.push_back("IKEv2 NAT-T responder on UDP/4500"); score -= 5; }
-        if (p == 51820) { stack.push_back("WireGuard default port UDP/51820 answers handshake"); score -= 15; }
-        if (p == 41641) { stack.push_back("Tailscale default port UDP/41641 answers"); score -= 5; }
-        if (p == 443)   stack.push_back("QUIC/HTTP3 on UDP/443 (expected for HTTP3/CDN)");
+        if (p == 1194)  flag_major("OpenVPN UDP/1194 reflects HARD_RESET (protocol-level match)", 22);
+        if (p == 500)   flag_minor("IKEv2 responder on UDP/500 (IPsec endpoint)", 5);
+        if (p == 4500)  flag_minor("IKEv2 NAT-T responder on UDP/4500 (IPsec endpoint)", 5);
+        if (p == 51820) flag_major("WireGuard UDP/51820 answers handshake (default port signature)", 15);
+        if (p == 41641) flag_minor("Tailscale UDP/41641 answers handshake (default port)", 5);
     }
 
-    // ---- TLS posture -------------------------------------------------
+    // ---- TLS posture + cert red flags ------------------------------
     bool any_tls = false, any_reality = false, plain_tls_on_443 = false;
+    int  cert_issuers_seen_free_ca = 0;
+    int  cert_fresh_ports = 0;
+    int  cert_self_signed_ports = 0;
+    int  tls_not_13_ports = 0;
+    int  alpn_not_h2_ports = 0;
+    int  group_not_x25519_ports = 0;
     for (auto& pf: R.fps) {
         if (pf.tls && pf.tls->ok) {
             any_tls = true;
-            if (pf.tls->version != "TLSv1.3") { score -= 5; stack.push_back("TLS < 1.3 on :"+std::to_string(pf.port)); }
-            if (pf.tls->alpn != "h2")          stack.push_back("ALPN != h2 on :"+std::to_string(pf.port));
-            if (pf.tls->group != "X25519")     stack.push_back("key-exchange group != X25519 on :"+std::to_string(pf.port));
+            if (pf.tls->version != "TLSv1.3") {
+                flag_minor("TLS < 1.3 on :" + std::to_string(pf.port) +
+                           " (" + pf.tls->version + ") — weak handshake posture", 4);
+                ++tls_not_13_ports;
+            }
+            if (pf.tls->alpn != "h2") {
+                flag_minor("ALPN != h2 on :" + std::to_string(pf.port) +
+                           " (got '" + (pf.tls->alpn.empty()?"-":pf.tls->alpn) +
+                           "') — unlike a real h2/CDN front", 2);
+                ++alpn_not_h2_ports;
+            }
+            if (!pf.tls->group.empty() && pf.tls->group != "X25519") {
+                flag_minor("KEX group != X25519 on :" + std::to_string(pf.port) +
+                           " (" + pf.tls->group + ") — atypical for modern clients", 2);
+                ++group_not_x25519_ports;
+            }
+            if (pf.tls->age_days > 0 && pf.tls->age_days < 14) {
+                flag_minor("cert on :" + std::to_string(pf.port) +
+                           " is fresh (" + std::to_string(pf.tls->age_days) +
+                           "d) — common fingerprint of a newly-provisioned proxy / Reality host", 4);
+                ++cert_fresh_ports;
+            } else if (pf.tls->age_days >= 14 && pf.tls->age_days < 45 && hosting_hits) {
+                flag_minor("cert on :" + std::to_string(pf.port) +
+                           " is relatively young (" + std::to_string(pf.tls->age_days) +
+                           "d) on a hosting ASN — weak signal", 2);
+            }
+            if (pf.tls->self_signed) {
+                flag_major("self-signed cert on :" + std::to_string(pf.port) +
+                           " (subject==issuer) — browsers would reject; typical of Shadowsocks/Trojan setups", 10);
+                ++cert_self_signed_ports;
+            }
+            if (pf.tls->is_letsencrypt) {
+                ++cert_issuers_seen_free_ca;
+                // no direct penalty — LE is also the default for legit small sites
+            }
+            if (pf.tls->days_left < 0) {
+                flag_minor("cert on :" + std::to_string(pf.port) +
+                           " EXPIRED " + std::to_string(-pf.tls->days_left) +
+                           "d ago — nobody real runs this, strong abandonment/proxy signal", 8);
+            }
+            if (pf.tls->san_count == 0 && !pf.tls->subject_cn.empty()) {
+                flag_minor("cert on :" + std::to_string(pf.port) +
+                           " has no SAN entries (only legacy CN) — unusual for modern public TLS", 3);
+            }
         }
         if (pf.sni && pf.sni->reality_like) {
             any_reality = true;
             ++reality_port_count;
             // Reality IS identifiable — the very fact we can recognise it
-            // as Reality means a DPI engine can too. Apply a small penalty.
-            score -= 5;
+            // as Reality means a DPI engine can too. Small penalty.
+            flag_major("Reality cert-steering pattern on :" + std::to_string(pf.port) +
+                       " (cert covers foreign SNI '" + pf.sni->matched_foreign_sni + "')", 8);
         }
     }
 
-    // ---- J3 active-probe roles --------------------------------------
+    // ---- J3 active-probe roles -------------------------------------
+    int j3_silent_total = 0, j3_resp_total = 0, j3_ports_checked = 0;
     for (auto& pf: R.fps) {
         if (pf.j3.size() < 6) continue;
+        ++j3_ports_checked;
         int sil = 0, rsp = 0;
         for (auto& j: pf.j3) { if (j.responded) ++rsp; else ++sil; }
+        j3_silent_total += sil;
+        j3_resp_total   += rsp;
         bool has_reality = pf.sni && pf.sni->reality_like;
         bool tls_ok      = pf.tls && pf.tls->ok;
         bool tls_failed  = pf.tls && !pf.tls->ok;
 
+        // per-port role string — now carries TLS + cert summary
+        string role;
         if (has_reality && tls_ok) {
             if (sil >= 6) {
-                port_roles.push_back({pf.port,
-                    "Reality (hidden-mode: silent-on-junk — strong DPI signature)"});
+                role = "Reality hidden-mode (silent-on-junk — strong DPI signature)";
                 xray_reality_hidden = true;
                 score -= 3;
             } else if (rsp >= 4) {
-                port_roles.push_back({pf.port,
-                    "Reality + HTTP fallback (mimics real web server on junk)"});
+                role = "Reality + HTTP fallback (mimics real web server on junk)";
                 xray_reality_primary = true;
-                // no extra penalty: best-practice Reality configuration
             } else {
-                port_roles.push_back({pf.port, "Reality (TLS endpoint)"});
+                role = "Reality (TLS endpoint)";
             }
         } else if (tls_ok) {
-            // Plain TLS server — NOT Reality.
             if (pf.port == 443) plain_tls_on_443 = true;
             if (rsp >= 7)
-                port_roles.push_back({pf.port, "generic HTTPS / CDN (not Reality)"});
+                role = "generic HTTPS / CDN origin";
             else
-                port_roles.push_back({pf.port, "TLS endpoint (not Reality)"});
+                role = "TLS endpoint (not Reality)";
+            // enrich with cert summary
+            char buf[256] = {0};
+            snprintf(buf, sizeof(buf),
+                     " — %s / ALPN=%s / CN=%s / issuer=%s / age=%dd / SAN=%d",
+                     pf.tls->version.c_str(),
+                     pf.tls->alpn.empty() ? "-" : pf.tls->alpn.c_str(),
+                     pf.tls->subject_cn.empty() ? "(none)" : pf.tls->subject_cn.c_str(),
+                     pf.tls->issuer_cn.empty() ? "(none)" : pf.tls->issuer_cn.c_str(),
+                     pf.tls->age_days, pf.tls->san_count);
+            role += buf;
         } else if (tls_failed && sil >= 6) {
-            // Silent-on-junk with a failed TLS handshake: high ambiguity.
-            // Could be Reality strict-mode, Shadowsocks AEAD, Trojan, or a
-            // firewalled service. Do NOT claim Reality without the cert
-            // fingerprint evidence. Report as ambiguous.
-            port_roles.push_back({pf.port,
-                "silent-on-junk (ambiguous: Reality strict / SS-AEAD / Trojan / firewall)"});
-            score -= 5;
+            role = "silent-on-junk (ambiguous: Reality-strict / SS-AEAD / Trojan / firewall)";
+            flag_minor("port :" + std::to_string(pf.port) +
+                       " is silent on junk AND rejects TLS — DPI-ambiguous profile", 4);
+        } else if (tls_failed) {
+            role = "TLS handshake failed + mixed probes (ambiguous)";
         }
+        if (!role.empty()) port_roles.push_back({pf.port, role});
     }
 
-    // ---- SSH role classification ------------------------------------
+    // ---- SSH role classification -----------------------------------
     for (auto& o: R.open_tcp) {
         bool is_ssh_std  = (o.port==22 || o.port==2222 || o.port==22222);
         bool has_banner  = !o.banner.empty() && o.banner.rfind("SSH-",0)==0;
         if (is_ssh_std && has_banner)
-            port_roles.push_back({o.port, "SSH (advertised banner, standard port)"});
+            port_roles.push_back({o.port, "SSH (advertised banner, standard port) — '" +
+                                          printable_prefix(o.banner, 40) + "'"});
         else if (has_banner && !is_ssh_std)
-            port_roles.push_back({o.port, "SSH on non-standard port (banner still leaks version)"});
+            port_roles.push_back({o.port, "SSH on non-standard port (banner still leaks version) — '" +
+                                          printable_prefix(o.banner, 40) + "'"});
     }
+
+    // ---- HTTP-only port roles --------------------------------------
+    for (auto& pf: R.fps) {
+        if (pf.fp.service == "HTTP" || pf.fp.service == "HTTP?") {
+            port_roles.push_back({pf.port, "plain HTTP — " +
+                                          (pf.fp.details.empty() ? "no banner" : printable_prefix(pf.fp.details, 90))});
+        } else if (pf.fp.service == "HTTP-PROXY") {
+            port_roles.push_back({pf.port, "OPEN HTTP PROXY (accepts CONNECT) — " +
+                                          printable_prefix(pf.fp.details, 80)});
+            flag_major("open HTTP proxy (accepts CONNECT) on :" + std::to_string(pf.port), 20);
+        } else if (pf.fp.service == "SOCKS5") {
+            port_roles.push_back({pf.port, "OPEN SOCKS5 — " +
+                                          printable_prefix(pf.fp.details, 80)});
+            flag_major("open SOCKS5 endpoint on :" + std::to_string(pf.port), 20);
+        }
+    }
+
+    // ---- COMBO penalty ---------------------------------------------
+    int minor_count = (int)signals_minor.size();
+    if (minor_count >= 5)
+        flag_minor("[COMBO] " + std::to_string(minor_count) +
+                   " independent soft signals stack up — pattern fits a single-purpose proxy host", 12);
+    else if (minor_count >= 3)
+        flag_minor("[COMBO] " + std::to_string(minor_count) +
+                   " independent soft signals — looks like a plain VPS front, not a CDN/corporate host", 6);
 
     score = std::max(0, std::min(100, score));
     R.score = score;
@@ -2048,7 +2232,7 @@ static FullReport run_full_target(const string& target) {
 
     const char* color = score>=85?C::GRN : score>=70?C::YEL : score>=50?C::YEL : C::RED;
 
-    // ---- Stack identification (strict, no guessing) -----------------
+    // ---- Stack identification (strict, no guessing) ----------------
     string stack_name;
     bool any_wg = std::any_of(R.udp_probes.begin(), R.udp_probes.end(),
                               [](auto& x){return x.first==51820 && x.second.responded;});
@@ -2069,7 +2253,7 @@ static FullReport run_full_target(const string& target) {
     else if (openset.count(8388) || openset.count(8488))
         stack_name = "Shadowsocks (naked default port)";
     else if (any_tls && openset.count(443))
-        stack_name = "generic TLS / HTTPS origin (no VPN signature)";
+        stack_name = "generic TLS / HTTPS origin (no direct VPN signature)";
     else
         stack_name = "no VPN protocol signature identified";
 
@@ -2080,12 +2264,138 @@ static FullReport run_full_target(const string& target) {
     if (!port_roles.empty()) {
         printf("\n  %sPer-port classification:%s\n", col(C::BOLD), col(C::RST));
         for (auto& [p, role]: port_roles)
-            printf("    :%-5d  %s\n", p, role.c_str());
+            printf("    %s:%-5d%s  %s\n", col(C::CYN), p, col(C::RST), role.c_str());
     }
 
-    printf("\n  %sAdditional signals:%s\n", col(C::BOLD), col(C::RST));
-    if (stack.empty()) printf("    (none — no additional red flags)\n");
-    else for (auto& s: stack) printf("    - %s\n", s.c_str());
+    // ---- DPI exposure matrix (new in v2.2) -------------------------
+    auto axis = [&](const char* name, const char* level, const string& note) {
+        const char* c = !strcmp(level,"HIGH")   ? C::RED :
+                        !strcmp(level,"MEDIUM") ? C::YEL :
+                        !strcmp(level,"LOW")    ? C::GRN :
+                        !strcmp(level,"NONE")   ? C::DIM : C::CYN;
+        dpi_axes.push_back({name, string(level) + " — " + note});
+        printf("    %-36s %s%-6s%s  %s\n", name, col(c), level, col(C::RST), note.c_str());
+    };
+
+    printf("\n  %sDPI exposure matrix:%s\n", col(C::BOLD), col(C::RST));
+    // 1. Port-based (TSPU curated list)
+    {
+        int naive_hits = 0;
+        for (int p: {1194, 1723, 500, 4500, 51820, 1701, 8388, 8488, 8090, 10808, 10809})
+            if (openset.count(p)) ++naive_hits;
+        axis("Port-based (default VPN ports)",
+             naive_hits >= 2 ? "HIGH" : naive_hits == 1 ? "MEDIUM" : "LOW",
+             naive_hits ? std::to_string(naive_hits) + " default VPN port(s) open" :
+                          "no default VPN ports among open set");
+    }
+    // 2. Protocol handshake signature (plaintext VPN reply)
+    {
+        bool ovpn = any_ovpn_udp || openset.count(1194);
+        bool wg   = any_wg;
+        bool ike  = false;
+        for (auto& [p,u]: R.udp_probes) if ((p==500||p==4500) && u.responded) ike = true;
+        if (ovpn || wg)      axis("Protocol handshake signature", "HIGH",
+                                  string(ovpn?"OpenVPN ":"") + (wg?"WireGuard":"") + " signature matched");
+        else if (ike)        axis("Protocol handshake signature", "MEDIUM", "IKEv2 responds on control ports");
+        else if (any_reality) axis("Protocol handshake signature", "LOW", "TLS 1.3 handshake looks normal (Reality identified by cert-steering, not handshake bytes)");
+        else if (any_tls)    axis("Protocol handshake signature", "LOW", "TLS handshake looks normal");
+        else                 axis("Protocol handshake signature", "NONE", "no TLS / no VPN protocol replies");
+    }
+    // 3. Cert-steering (Reality discriminator)
+    {
+        if (any_reality)            axis("Cert-steering (Reality discriminator)", "HIGH",
+                                         "Reality steering pattern positively identified");
+        else {
+            bool same_cert_seen = false, varies_seen = false;
+            for (auto& pf: R.fps) if (pf.sni) {
+                if (pf.sni->same_cert_always) same_cert_seen = true;
+                else if (!pf.sni->default_cert_only) varies_seen = true;
+            }
+            if (varies_seen)        axis("Cert-steering (Reality discriminator)", "NONE",
+                                         "cert varies per SNI (multi-tenant TLS, not Reality)");
+            else if (same_cert_seen) axis("Cert-steering (Reality discriminator)", "NONE",
+                                          "single default cert — plain server, not Reality");
+            else                    axis("Cert-steering (Reality discriminator)", "NONE",
+                                         "no TLS to test");
+        }
+    }
+    // 4. ASN classifier
+    {
+        if (hosting_hits >= 2)   axis("ASN classifier (VPS/hosting)", "MEDIUM",
+                                      std::to_string(hosting_hits) + " sources flag hosting/datacenter ASN");
+        else if (hosting_hits == 1) axis("ASN classifier (VPS/hosting)", "LOW",
+                                         "1 source flags hosting ASN (ambiguous)");
+        else                     axis("ASN classifier (VPS/hosting)", "NONE",
+                                      "no GeoIP source classifies the ASN as hosting");
+    }
+    // 5. VPN/Proxy tags from threat-intel
+    {
+        if (vpn_hits >= 2 || proxy_hits >= 2 || tor_hits) {
+            string note = std::to_string(vpn_hits) + " VPN / " + std::to_string(proxy_hits) +
+                          " proxy / " + std::to_string(tor_hits) + " Tor tags";
+            axis("Threat-intel tags (VPN/Proxy/Tor)", "HIGH", note);
+        } else if (vpn_hits || proxy_hits) {
+            axis("Threat-intel tags (VPN/Proxy/Tor)", "LOW", "single-source tag (weak)");
+        } else {
+            axis("Threat-intel tags (VPN/Proxy/Tor)", "NONE", "no VPN/Proxy/Tor tag from any source");
+        }
+    }
+    // 6. Cert freshness
+    {
+        if (cert_fresh_ports >= 1) axis("Cert freshness (new-LE watch)", "MEDIUM",
+                                         std::to_string(cert_fresh_ports) +
+                                         " port(s) with cert <14d old");
+        else                      axis("Cert freshness (new-LE watch)", "LOW",
+                                       "no suspiciously fresh certs");
+    }
+    // 7. Active junk probing (J3)
+    {
+        if (j3_ports_checked == 0)   axis("Active junk probing (J3)", "NONE", "no J3 probes ran");
+        else if (j3_silent_total >= j3_resp_total && j3_silent_total >= 4)
+            axis("Active junk probing (J3)", "MEDIUM",
+                 std::to_string(j3_silent_total) + " silent / " + std::to_string(j3_resp_total) +
+                 " resp — strict TLS-only posture (fingerprintable by TSPU)");
+        else if (j3_resp_total >= j3_silent_total)
+            axis("Active junk probing (J3)", "LOW",
+                 std::to_string(j3_resp_total) + " responses — looks like a permissive web-origin");
+        else
+            axis("Active junk probing (J3)", "LOW",
+                 std::to_string(j3_silent_total) + " silent / " + std::to_string(j3_resp_total) + " resp");
+    }
+    // 8. Open-port profile
+    {
+        size_t np = R.open_tcp.size();
+        if (np == 1 && openset.count(443))
+            axis("Open-port profile (sparsity)", "MEDIUM",
+                 ":443 only — classic single-purpose reverse-proxy / Reality front");
+        else if (np <= 3 && openset.count(443) && hosting_hits)
+            axis("Open-port profile (sparsity)", "LOW",
+                 "sparse (<=3 ports) on hosting ASN — VPS proxy profile");
+        else if (np >= 8)
+            axis("Open-port profile (sparsity)", "LOW",
+                 std::to_string(np) + " ports open — diverse service host, not a dedicated proxy");
+        else
+            axis("Open-port profile (sparsity)", "LOW",
+                 std::to_string(np) + " ports open");
+    }
+    // 9. TLS posture quality
+    {
+        int bad = tls_not_13_ports + alpn_not_h2_ports + cert_self_signed_ports;
+        if (bad >= 2) axis("TLS hygiene (1.3 + h2 + trusted-CA)", "MEDIUM",
+                           std::to_string(bad) + " hygiene issues (weak TLS / ALPN / self-signed)");
+        else if (bad == 1) axis("TLS hygiene (1.3 + h2 + trusted-CA)", "LOW", "1 hygiene issue");
+        else if (any_tls)  axis("TLS hygiene (1.3 + h2 + trusted-CA)", "LOW", "TLS posture is clean (1.3 + h2 + trusted-CA)");
+        else               axis("TLS hygiene (1.3 + h2 + trusted-CA)", "NONE", "no TLS observed");
+    }
+
+    // ---- Signal lists ----------------------------------------------
+    printf("\n  %sStrong signals (%zu):%s\n", col(C::BOLD), signals_major.size(), col(C::RST));
+    if (signals_major.empty()) printf("    (none)\n");
+    else for (auto& s: signals_major) printf("    %s[!]%s %s\n", col(C::RED), col(C::RST), s.c_str());
+
+    printf("\n  %sSoft signals (%zu):%s\n", col(C::BOLD), signals_minor.size(), col(C::RST));
+    if (signals_minor.empty()) printf("    (none)\n");
+    else for (auto& s: signals_minor) printf("    %s[-]%s %s\n", col(C::YEL), col(C::RST), s.c_str());
 
     printf("\n  %sFinal score:%s %s%d/100%s  verdict: %s%s%s\n",
            col(C::BOLD), col(C::RST), col(C::BOLD), score, col(C::RST),

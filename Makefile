@@ -49,23 +49,27 @@ static: $(SRC)
 	    -Wl,-Bstatic -lssl -lcrypto -Wl,-Bdynamic -lpthread -ldl
 
 # -----------------------------------------------------------------
-# Release zip: single static .exe + LICENSE + README.md
-# Output: byebyevpn-win64.zip containing ONE runnable exe.
+# Release zip: single static .exe + LICENSE + README.md + CHANGELOG.md
+# Output: byebyevpn-<VERSION>-win64.zip containing ONE runnable exe.
+# Override with:  make release-zip VERSION=v2.3
 # -----------------------------------------------------------------
+VERSION ?= v2.2
+ZIP_NAME = $(BIN)-$(VERSION)-win64.zip
+
 release-zip: windows-static
 	@rm -rf dist-release && mkdir -p dist-release
 	@cp $(BIN).exe dist-release/
-	@cp LICENSE README.md dist-release/
+	@cp LICENSE README.md CHANGELOG.md dist-release/
 	@cd dist-release && \
-	  (command -v zip >/dev/null && zip -9 ../$(BIN)-win64.zip *) || \
-	  powershell -Command "Compress-Archive -Path dist-release\\* -DestinationPath $(BIN)-win64.zip -Force"
-	@ls -la $(BIN)-win64.zip
+	  (command -v zip >/dev/null && zip -9 ../$(ZIP_NAME) *) || \
+	  powershell -Command "Compress-Archive -Path dist-release\\* -DestinationPath $(ZIP_NAME) -Force"
+	@ls -la $(ZIP_NAME)
 
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)/usr/local/bin/$(BIN)
 
 clean:
-	rm -f $(BIN) $(BIN)-static $(BIN).exe $(BIN)-win64.zip
+	rm -f $(BIN) $(BIN)-static $(BIN).exe $(BIN)-*-win64.zip $(BIN)-win64.zip
 	rm -rf dist-release
 
 .PHONY: all windows windows-static static release-zip install clean
