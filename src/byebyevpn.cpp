@@ -113,7 +113,7 @@ static void banner() {
     puts("|____/ \\__, |\\___|____/ \\__, |\\___| \\_/  |_|   |_| \\_|");
     puts("       |___/            |___/                          ");
     printf("%s", col(C::RST));
-    printf("%s  Full TSPU/DPI/VPN detectability scanner  v2.2%s\n\n",
+    printf("%s  Full TSPU/DPI/VPN detectability scanner  v2.3%s\n\n",
            col(C::DIM), col(C::RST));
 }
 
@@ -553,20 +553,101 @@ static GeoInfo geo_freeipapi(const string& ip) {
     return g;
 }
 
-// 2ip.io / api.2ip.me  —  Russian-hosted, widely used RU-side checker
-// Endpoint: http://api.2ip.me/geo.json?ip=...  (HTTP, no key needed)
+// ----------------------------------------------------------------------------
+// 3 RU-facing providers — important because RU-origin GeoIP sees Russian
+// hosting differently from EU/US providers (VEESP, Hostkey, Ruvds etc.)
+// ----------------------------------------------------------------------------
+
+// 2ip.me / 2ip.ru  —  Russian IP-checker (HTTPS with proper UA)
+// api.2ip.me/geo.json returns 429 without a browser UA, so we go through
+// the HTML-less JSON endpoint with explicit Accept/UA (http_get already
+// sends Mozilla UA).
 static GeoInfo geo_2ip_ru(const string& ip) {
-    GeoInfo g; g.source = "2ip.io (RU)";
-    string url = "http://api.2ip.me/geo.json";
-    if (!ip.empty()) url += "?ip=" + ip;
+    GeoInfo g; g.source = "2ip.ru (RU)";
+    // Prefer HTTPS, fall back to HTTP. The .me endpoint tends to 429 with
+    // no-key access; the /geoip/ JSON on the main domain is more lenient.
+    string url = "https://2ip.io/geoip/" + ip + "/";
     auto r = http_get(url);
+    if (!r.ok() || r.body.find("country") == string::npos) {
+        url = "http://api.2ip.me/geo.json?ip=" + ip;
+        r = http_get(url);
+    }
     if (!r.ok()) { g.err = "http " + std::to_string(r.status) + " " + r.err; return g; }
     g.ip           = json_get_str(r.body, "ip");
+    if (g.ip.empty()) g.ip = ip;
     g.country      = json_get_str(r.body, "country");
     if (g.country.empty()) g.country = json_get_str(r.body, "country_rus");
+    if (g.country.empty()) g.country = json_get_str(r.body, "countryName");
     g.country_code = json_get_str(r.body, "country_code");
+    if (g.country_code.empty()) g.country_code = json_get_str(r.body, "countryCode");
     g.city         = json_get_str(r.body, "city");
     if (g.city.empty()) g.city = json_get_str(r.body, "city_rus");
+    if (g.city.empty()) g.city = json_get_str(r.body, "cityName");
+    string org     = json_get_str(r.body, "org");
+    if (!org.empty()) g.asn_org = org;
+    return g;
+}
+
+// ip-api.com/ru  —  same backend as ip-api.com but the /ru/ path returns
+// Russian-localised location strings AND carries a different endpoint-
+// -tier for RU-routed clients.  We call it with a distinct source label
+// so it counts as an independent RU-side opinion (they rate-limit per
+// source IP per endpoint).
+static GeoInfo geo_ipapi_ru(const string& ip) {
+    GeoInfo g; g.source = "ip-api.com/ru (RU)";
+    string url = "http://ip-api.com/json/";
+    if (!ip.empty()) url += ip;
+    url += "?lang=ru&fields=status,country,countryCode,city,isp,org,as,asname,hosting,proxy,mobile,query";
+    auto r = http_get(url);
+    if (!r.ok()) { g.err = "http " + std::to_string(r.status) + " " + r.err; return g; }
+    g.ip           = json_get_str(r.body, "query");
+    g.country      = json_get_str(r.body, "country");
+    g.country_code = json_get_str(r.body, "countryCode");
+    g.city         = json_get_str(r.body, "city");
+    g.asn          = json_get_str(r.body, "as");
+    g.asn_org      = json_get_str(r.body, "isp");
+    if (g.asn_org.empty()) g.asn_org = json_get_str(r.body, "org");
+    g.is_hosting   = json_get_str(r.body, "hosting") == "true";
+    g.is_proxy     = json_get_str(r.body, "proxy")   == "true";
+    return g;
+}
+
+// SypexGeo — Russian GeoIP project, public API, no key needed for city-level
+// lookups.  Endpoint returns JSON with country/city/lat/lon.
+static GeoInfo geo_sypex(const string& ip) {
+    GeoInfo g; g.source = "sypexgeo.net (RU)";
+    string url = "http://api.sypexgeo.net/json/" + ip;
+    auto r = http_get(url);
+    if (!r.ok()) { g.err = "http " + std::to_string(r.status) + " " + r.err; return g; }
+    g.ip           = ip;
+    // Their JSON is nested: country.name_en, city.name_en, region.name_en
+    g.country_code = json_get_str(r.body, "iso");
+    // try nested
+    {
+        size_t cp = r.body.find("\"country\"");
+        if (cp != string::npos) {
+            size_t ob = r.body.find('{', cp);
+            size_t ce = ob == string::npos ? string::npos : r.body.find('}', ob);
+            if (ob != string::npos && ce != string::npos) {
+                string sb = r.body.substr(ob, ce - ob + 1);
+                g.country = json_get_str(sb, "name_en");
+                if (g.country.empty()) g.country = json_get_str(sb, "name_ru");
+                if (g.country_code.empty()) g.country_code = json_get_str(sb, "iso");
+            }
+        }
+    }
+    {
+        size_t cp = r.body.find("\"city\"");
+        if (cp != string::npos) {
+            size_t ob = r.body.find('{', cp);
+            size_t ce = ob == string::npos ? string::npos : r.body.find('}', ob);
+            if (ob != string::npos && ce != string::npos) {
+                string sb = r.body.substr(ob, ce - ob + 1);
+                g.city = json_get_str(sb, "name_en");
+                if (g.city.empty()) g.city = json_get_str(sb, "name_ru");
+            }
+        }
+    }
     return g;
 }
 
@@ -1014,6 +1095,245 @@ static TlsProbe tls_probe(const string& ip, int port, const string& sni,
 }
 
 // ============================================================================
+// Brand-cert impersonation detection  (v2.3)
+//
+// Classical Xray/VLESS+Reality "static dest" setup: the operator sets
+// `dest=www.amazon.com:443` in Reality config, so when ANY SNI-less TLS
+// client connects, the Reality listener proxies the handshake to the real
+// amazon.com and forwards amazon's cert back to us. Result: a random VPS
+// in US on AS56971 CGI GLOBAL LIMITED returns CN=www.amazon.com. That's
+// NOT "plain server" — that's impersonation, which is also the exact
+// Reality-static profile TSPU/GFW fingerprint.
+//
+// We detect this by cross-referencing:
+//   (a) cert CN / SAN list against a curated list of famous brand domains
+//   (b) ASN-org strings against a list of markers that would legitimately
+//       own those brands
+//
+// If a brand cert is served but the ASN clearly doesn't belong to that
+// brand, it's impersonation.
+// ============================================================================
+struct BrandMarker {
+    const char* brand;        // the domain the cert claims
+    const char* asn_markers;  // comma-separated ASN-org substrings that
+                              // legitimately run this brand's endpoints
+};
+static const BrandMarker BRAND_TABLE[] = {
+    {"amazon.com",     "amazon,aws,a100 row,amazon technologies"},
+    {"aws.amazon.com", "amazon,aws"},
+    {"microsoft.com",  "microsoft,msn,msft,akamai,edgecast"},
+    {"apple.com",      "apple,akamai"},
+    {"google.com",     "google,gts,gcp,youtube"},
+    {"googleusercontent.com", "google,gcp"},
+    {"youtube.com",    "google,youtube"},
+    {"cloudflare.com", "cloudflare,cloudflare inc"},
+    {"github.com",     "github,microsoft,fastly"},
+    {"yandex.ru",      "yandex"},
+    {"yandex.net",     "yandex"},
+    {"yandex.com",     "yandex"},
+    {"yahoo.com",      "yahoo,oath,verizon"},
+    {"facebook.com",   "facebook,meta"},
+    {"instagram.com",  "facebook,meta"},
+    {"whatsapp.com",   "facebook,meta"},
+    {"twitter.com",    "twitter,x corp"},
+    {"x.com",          "twitter,x corp"},
+    {"netflix.com",    "netflix,akamai"},
+    {"cdn.jsdelivr.net","fastly,cloudflare"},
+    {"bing.com",       "microsoft"},
+    {"gstatic.com",    "google"},
+    {"mail.ru",        "mail.ru,vk"},
+    {"vk.com",         "vk,mail.ru"},
+    {"wikipedia.org",  "wikimedia"},
+    {"linkedin.com",   "linkedin,microsoft"},
+    {"office.com",     "microsoft"},
+    {"live.com",       "microsoft"},
+};
+static const size_t BRAND_TABLE_N = sizeof(BRAND_TABLE)/sizeof(BRAND_TABLE[0]);
+
+// Returns empty if no brand match, else the brand domain the cert vouches for.
+// Checks subject CN + all SAN entries.
+static string cert_claims_brand(const string& subject_cn,
+                                const vector<string>& san) {
+    auto is_brand = [](const string& name)->const char*{
+        if (name.empty()) return nullptr;
+        string ln = name;
+        for (auto& c: ln) c = (char)std::tolower((unsigned char)c);
+        // strip leading "*." from wildcard names
+        if (ln.size() > 2 && ln[0]=='*' && ln[1]=='.') ln = ln.substr(2);
+        for (size_t i=0;i<BRAND_TABLE_N;++i) {
+            string b = BRAND_TABLE[i].brand;
+            if (ln == b) return BRAND_TABLE[i].brand;
+            if (ln.size() > b.size() + 1 &&
+                ln.compare(ln.size()-b.size(), b.size(), b) == 0 &&
+                ln[ln.size()-b.size()-1] == '.') return BRAND_TABLE[i].brand;
+        }
+        return nullptr;
+    };
+    const char* hit = is_brand(subject_cn);
+    if (hit) return hit;
+    for (auto& s: san) { hit = is_brand(s); if (hit) return hit; }
+    return {};
+}
+
+// Given a brand and the scanned host's GeoIP ASN-org list, return true iff
+// the ASN legitimately owns the brand.
+static bool asn_owns_brand(const string& brand_domain,
+                           const vector<string>& asn_orgs) {
+    if (brand_domain.empty() || asn_orgs.empty()) return false;
+    const char* markers = nullptr;
+    for (size_t i=0;i<BRAND_TABLE_N;++i) {
+        if (brand_domain == BRAND_TABLE[i].brand) {
+            markers = BRAND_TABLE[i].asn_markers; break;
+        }
+    }
+    if (!markers) return false;
+    string ms = markers;
+    for (auto& c: ms) c = (char)std::tolower((unsigned char)c);
+    vector<string> parts = split(ms, ',');
+    for (auto& org: asn_orgs) {
+        string lo = org;
+        for (auto& c: lo) c = (char)std::tolower((unsigned char)c);
+        for (auto& m: parts) {
+            string mm = trim(m);
+            if (!mm.empty() && lo.find(mm) != string::npos) return true;
+        }
+    }
+    return false;
+}
+
+// Given an HTTP `Server:` header value, return the brand domain from
+// BRAND_TABLE that the banner unambiguously belongs to. Only triggers on
+// banners a real web server can never produce by accident — e.g.
+// "CloudFront" or "AmazonS3" (never set by nginx/Apache/Caddy), "gws"
+// (Google's proprietary frontend, only served by Google), etc. Empty
+// return = no brand mapping.
+static string server_header_brand(const string& server_hdr) {
+    if (server_hdr.empty()) return {};
+    string s = server_hdr;
+    for (auto& c: s) c = (char)std::tolower((unsigned char)c);
+    // Amazon / AWS
+    if (s.find("cloudfront") != string::npos) return "amazon.com";
+    if (s.find("amazons3")   != string::npos) return "amazon.com";
+    if (s.find("awselb")     != string::npos) return "amazon.com";
+    if (s.find("aws elb")    != string::npos) return "amazon.com";
+    // Google
+    if (s == "gws" || s.find("gws/") != string::npos) return "google.com";
+    if (s.find("gfe/")       != string::npos) return "google.com";
+    if (s.find("gse/")       != string::npos) return "google.com";
+    if (s.find("esf")        != string::npos) return "google.com";
+    // Cloudflare
+    if (s == "cloudflare" || s.find("cloudflare-nginx") != string::npos) return "cloudflare.com";
+    // Microsoft IIS / Azure
+    if (s.find("microsoft-iis")    != string::npos) return "microsoft.com";
+    if (s.find("microsoft-httpapi")!= string::npos) return "microsoft.com";
+    // Yandex
+    if (s.find("yandex")     != string::npos) return "yandex.ru";
+    // Apple
+    if (s.find("applehttpserver") != string::npos) return "apple.com";
+    // Fastly / Akamai are CDNs without brand-table entries — skip.
+    return {};
+}
+
+// ============================================================================
+// Active HTTP/1.1 probe inside an established TLS session  (v2.3)
+//
+// After the TLS handshake succeeds we try to actually speak HTTP on it.
+// A real web server (nginx/Apache/Caddy/CDN) will emit a proper HTTP/1.1
+// response line with a valid version (1.0/1.1/2), a legitimate status
+// code, and typically a Server: header. A stream-layer proxy (Xray/
+// Trojan/SS-AEAD) either closes the stream, returns garbage, or emits
+// a canned fallback like "HTTP/0.0 307 Temporary Redirect" (a classic
+// Xray `fallback+redirect` signature).
+// ============================================================================
+struct HttpsProbe {
+    bool   tls_ok   = false;
+    bool   responded = false;
+    int    bytes    = 0;
+    string first_line;     // trimmed response line
+    string server_hdr;     // Server: value
+    string http_version;   // "HTTP/1.1", "HTTP/0.0" (anomaly), ...
+    int    status_code = 0;
+    bool   version_anomaly = false;  // HTTP/x.y with x!=1,2 or malformed
+    bool   no_server_hdr   = false;  // responded but no Server: header
+    string err;
+};
+
+static HttpsProbe https_probe(const string& ip, int port, const string& host_hdr,
+                              int to_ms = 5000) {
+    HttpsProbe r;
+    string err;
+    SOCKET s = tcp_connect(ip, port, to_ms, err);
+    if (s == INVALID_SOCKET) { r.err = err; return r; }
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    SSL* ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, (int)s);
+    if (!host_hdr.empty()) SSL_set_tlsext_host_name(ssl, host_hdr.c_str());
+    // advertise http/1.1 only so any proper server picks it
+    static const unsigned char alpn_h11[] = {8,'h','t','t','p','/','1','.','1'};
+    SSL_set_alpn_protos(ssl, alpn_h11, sizeof(alpn_h11));
+    if (SSL_connect(ssl) != 1) {
+        r.err = "tls handshake failed";
+        SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
+        return r;
+    }
+    r.tls_ok = true;
+    string req = "GET / HTTP/1.1\r\nHost: " + (host_hdr.empty()?string("example.com"):host_hdr) +
+                 "\r\nUser-Agent: Mozilla/5.0 (compatible; ByeByeVPN/2.3)\r\nAccept: */*\r\n"
+                 "Connection: close\r\n\r\n";
+    SSL_write(ssl, req.data(), (int)req.size());
+    // Collect up to ~4KB of response
+    string body;
+    char buf[1024];
+    for (int i=0; i<6; ++i) {
+        int n = SSL_read(ssl, buf, sizeof(buf));
+        if (n <= 0) break;
+        body.append(buf, n);
+        if (body.size() >= 4096) break;
+    }
+    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
+    r.bytes = (int)body.size();
+    if (body.empty()) return r;
+    r.responded = true;
+    size_t nl = body.find('\n');
+    r.first_line = trim(body.substr(0, nl == string::npos ? body.size() : nl));
+    // parse "HTTP/x.y CODE REASON"
+    if (starts_with(r.first_line, "HTTP/")) {
+        size_t sp = r.first_line.find(' ');
+        r.http_version = r.first_line.substr(0, sp == string::npos ? r.first_line.size() : sp);
+        // x.y check
+        if (r.http_version.size() >= 8) {
+            char x = r.http_version[5], y = r.http_version[7];
+            if (!(x=='1' || x=='2') || !(y=='0' || y=='1')) r.version_anomaly = true;
+            // HTTP/2.1, HTTP/3.x text, HTTP/0.0 etc. are all anomalies
+            if (x=='0') r.version_anomaly = true;
+        } else r.version_anomaly = true;
+        if (sp != string::npos) {
+            size_t sp2 = r.first_line.find(' ', sp+1);
+            if (sp2 != string::npos) {
+                string code = r.first_line.substr(sp+1, sp2 - sp - 1);
+                r.status_code = atoi(code.c_str());
+            }
+        }
+    } else {
+        // not HTTP at all — responded with raw bytes
+        r.version_anomaly = true;
+    }
+    // Server: header
+    size_t sh = body.find("\nServer:");
+    if (sh == string::npos) sh = body.find("\nserver:");
+    if (sh != string::npos) {
+        size_t se = body.find('\n', sh + 1);
+        string sv = body.substr(sh + 8, (se == string::npos ? body.size() : se) - (sh + 8));
+        r.server_hdr = trim(sv);
+    } else {
+        r.no_server_hdr = (r.status_code > 0);  // HTTP-ish but no Server:
+    }
+    return r;
+}
+
+// ============================================================================
 // SNI consistency test — probe with foreign SNIs, compare cert fingerprints.
 //
 // Reality discriminator (vs. plain TLS-with-one-cert false-positive):
@@ -1036,6 +1356,20 @@ struct SniConsistency {
     bool reality_like = false;
     bool default_cert_only = false; // plain server with a single default cert
     string matched_foreign_sni;     // which probed SNI the cert actually serves
+    // v2.3 — brand impersonation detection
+    string brand_claimed;            // brand domain the cert vouches for
+    bool   cert_impersonation = false; // brand cert served AND base_sni is not
+                                       // a brand-owned name AND we'll check ASN
+                                       // ownership at verdict time
+    bool   passthrough_mode = false;   // Reality with real passthrough to `dest=`:
+                                       // base (SNI-less) cert is for a famous
+                                       // brand, yet per-SNI probes see different
+                                       // certs — because the TLS stream is
+                                       // transparently tunnelled to the real
+                                       // brand, which then does its own SNI
+                                       // routing. Classic stealth-optimised
+                                       // Reality config.
+    int    distinct_certs = 0;         // number of distinct cert SHAs observed
 };
 
 // Case-insensitive DNS-name match with wildcard support ("*.example.com").
@@ -1076,11 +1410,27 @@ static SniConsistency sni_consistency(const string& ip, int port, const string& 
     c.base_sha     = base.cert_sha256;
     c.base_subject = base.cert_subject;
     c.base_san     = base.san;
+    // v2.3 — expanded probe list: common "dest=" targets for Xray/VLESS+Reality
+    // setups (amazon/apple/microsoft/google etc.) + unrelated SNIs + a junk SNI.
+    // This catches both "cert steering to dest" (Reality) and "cert statically
+    // impersonates a famous brand" (Reality-static).
     static const vector<string> alt = {
-        "www.microsoft.com", "www.apple.com", "addons.mozilla.org",
-        "random-domain-that-does-not-exist.example", "www.yandex.ru"
+        "www.microsoft.com",        // classic default dest
+        "www.apple.com",             // common dest
+        "www.amazon.com",            // common dest
+        "www.google.com",            // common dest
+        "www.cloudflare.com",        // common dest
+        "www.bing.com",              // common dest
+        "addons.mozilla.org",        // non-brand foreign SNI
+        "www.yandex.ru",             // RU-side foreign SNI
+        "www.github.com",            // common dest
+        "random-domain-that-does-not-exist.invalid"  // junk — catches
+                                                      // "always-accept-any-SNI"
+                                                      // plain servers
     };
     int same = 0, total = 0;
+    set<string> distinct;
+    if (!base.cert_sha256.empty()) distinct.insert(base.cert_sha256);
     for (auto& s: alt) {
         TlsProbe p = tls_probe(ip, port, s);
         SniConsistency::Entry e;
@@ -1091,22 +1441,31 @@ static SniConsistency sni_consistency(const string& ip, int port, const string& 
         if (p.ok) {
             ++total;
             if (p.cert_sha256 == base.cert_sha256) ++same;
+            if (!p.cert_sha256.empty()) distinct.insert(p.cert_sha256);
         }
         c.entries.push_back(std::move(e));
     }
+    c.distinct_certs = (int)distinct.size();
+
+    // Brand-claim ALWAYS runs on the base cert. A famous-brand CN on the
+    // origin's default SNI response is by itself the Reality-static
+    // signature, regardless of how per-SNI variation looks — the ASN
+    // cross-check at verdict time decides whether it's impersonation or
+    // a legitimate brand endpoint.
+    c.brand_claimed = cert_claims_brand(base.subject_cn, base.san);
+
     if (total >= 3 && same == total) {
         c.same_cert_always = true;
-        // Reality discriminator:
-        //   * Real Reality proxies to dest= (e.g. microsoft.com), so the
-        //     returned cert is valid for dest=, but NOT for the operator's
-        //     own hostname (base_sni). The operator owns "reality.example"
-        //     but the TLS cert shown to us is for "www.microsoft.com".
-        //   * A plain server (e.g. the actual microsoft.com) returns a
-        //     cert that covers its own hostname = base_sni. That is the
-        //     normal case — NOT Reality.
-        //   * A plain server with a mismatched default cert (e.g. nginx
-        //     showing a self-signed cert regardless of SNI) returns a cert
-        //     that covers neither base_sni nor any foreign probe SNI.
+        // Reality discriminator — covers 3 cases:
+        //   (A) Classical Reality: cert doesn't cover base_sni but covers
+        //       one of the probed foreign SNIs (steering to dest=).
+        //   (B) Reality-static / "pinned-brand" Reality: cert covers a
+        //       famous brand domain (from BRAND_TABLE) even though we
+        //       never sent that SNI as base. This is the Xray "fixed
+        //       dest" profile where the cert from dest= is shown to
+        //       every handshake.
+        //   (C) Plain server with one default cert: cert covers nothing
+        //       we asked about — neither base nor any foreign SNI.
         bool cert_covers_base = cert_covers_name(base_sni, base.cert_subject, base.san);
         if (!cert_covers_base) {
             for (auto& s: alt) {
@@ -1118,7 +1477,49 @@ static SniConsistency sni_consistency(const string& ip, int port, const string& 
                 }
             }
         }
+        if (!c.brand_claimed.empty()) {
+            // cert_impersonation flag is lit here, ASN cross-check
+            // happens at verdict time where we have GeoIP data.
+            c.cert_impersonation = true;
+            // If we didn't catch Reality via foreign-SNI match but the
+            // cert is for a brand, escalate to reality_like so the
+            // verdict engine treats it as Reality.
+            if (!c.reality_like && !cert_covers_base) {
+                c.reality_like = true;
+                c.matched_foreign_sni = c.brand_claimed;
+            }
+        }
         if (!c.reality_like) c.default_cert_only = true;
+    } else if (total >= 3 && same == 0 && c.distinct_certs >= 3) {
+        // Cert varies per SNI. If the base (SNI-less) cert is for a
+        // famous brand on a non-owning ASN, this is Reality in full
+        // passthrough-dest mode — the TLS stream is transparently
+        // tunnelled to the real brand, and the real brand does its own
+        // SNI-based vhost routing, which is why we see different certs
+        // for different SNIs. The giveaway is that the BASE probe (no
+        // SNI / host's own name) still returns a cert for a brand the
+        // IP's ASN doesn't own.
+        if (!c.brand_claimed.empty()) {
+            c.cert_impersonation = true;
+            c.reality_like = true;
+            c.matched_foreign_sni = c.brand_claimed;
+            c.passthrough_mode   = true;
+        }
+        // Otherwise it's real multi-tenant TLS — no hard signal.
+    } else if (total >= 3 && same > 0 && same < total) {
+        // Mixed: some SNIs share a cert, others get different ones.
+        // Could be a dual-stack (Reality + real vhost) host, or Reality
+        // with partial passthrough. Still a brand-on-non-owner-ASN is
+        // the key signal.
+        if (!c.brand_claimed.empty()) {
+            c.cert_impersonation = true;
+            // Mark as Reality-like: mixed cert behaviour with a brand
+            // cert on base is nearly always Reality (a real vhost with
+            // a brand cert would pass the "same_cert_always" test).
+            c.reality_like = true;
+            c.matched_foreign_sni = c.brand_claimed;
+            c.passthrough_mode   = true;
+        }
     }
     return c;
 }
@@ -1170,9 +1571,12 @@ static vector<J3Result> j3_probes(const string& host, int port) {
         }
         out.push_back(r);
     }
-    // 2) HTTP GET /
+    // 2) HTTP GET /  — use the REAL host as the Host: header so a real
+    //    web server (nginx/Apache/Caddy/CDN) can route properly and emit
+    //    a legitimate 200/301/404. Xray/Trojan fallbacks can't route, so
+    //    they emit the same canned reply as to junk probes.
     {
-        string req = "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: curl/8\r\n\r\n";
+        string req = "GET / HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: curl/8.4.0\r\nAccept: */*\r\n\r\n";
         out.push_back(j3_send(host, port, "HTTP GET /", req.data(), (int)req.size()));
     }
     // 3) CONNECT proxy-style
@@ -1229,6 +1633,105 @@ static vector<J3Result> j3_probes(const string& host, int port) {
         out.push_back(j3_send(host, port, "0xFF x128", garb, sizeof(garb)));
     }
     return out;
+}
+
+// ============================================================================
+// J3 response analysis  (v2.3)
+//
+// TSPU/GFW care about what the endpoint DOES with malformed input, not
+// just whether it replies. We bucket replies as:
+//   * real HTTP 4xx/5xx (normal web server behaviour)
+//   * canned-fallback (same bytes / same first-line for different probes,
+//     classic Xray `fallback+redirect` signature)
+//   * non-HTTP reply (raw framed bytes — stream-layer proxy talking
+//     protocol-of-its-own)
+//   * invalid HTTP version in the reply line (e.g. "HTTP/0.0 307")
+//   * pure silence (also normal for a strict TLS endpoint, kept here as
+//     data rather than a verdict)
+// ============================================================================
+struct J3Analysis {
+    int  silent = 0;
+    int  resp   = 0;
+    int  http_real = 0;        // replies start with HTTP/1.x or HTTP/2 and
+                               // carry a sane status code
+    int  http_bad_version = 0; // replies start with HTTP/ but with a
+                               // nonsense version (HTTP/0.0, HTTP/3.X text,
+                               // truncated "HTTP/"...)
+    int  raw_non_http = 0;     // responded, not HTTP-shaped (stream proxy
+                               // framing)
+    int  canned_identical = 0; // number of probes sharing first_line+bytes
+                               // with at least one OTHER probe
+    string canned_line;        // the canned first line that repeated
+    int  canned_bytes = 0;
+};
+
+static bool looks_like_http_line(const string& first_line, bool* bad_version_out = nullptr) {
+    if (first_line.size() < 9) return false;
+    if (first_line.compare(0, 5, "HTTP/") != 0) return false;
+    // version is 3 chars after "HTTP/", e.g. "1.1"
+    char x = first_line[5];
+    char dot = first_line.size() > 6 ? first_line[6] : 0;
+    char y = first_line.size() > 7 ? first_line[7] : 0;
+    if (dot != '.') return false;
+    // x must be 1 or 2; y must be 0 or 1 (for HTTP/1.0/1.1/2.0)
+    bool good_version = ((x=='1' && (y=='0' || y=='1')) || (x=='2' && y=='0'));
+    if (!good_version && bad_version_out) *bad_version_out = true;
+    return true;
+}
+
+static J3Analysis j3_analyze(const vector<J3Result>& probes) {
+    J3Analysis a;
+    // Count canned pairs: same first_line AND same byte count -> canned
+    // response regardless of what we sent.
+    //
+    // v2.3 refinement: a real web server returns the same HTTP 400 body
+    // to every MALFORMED probe — that's normal nginx behaviour, not a
+    // canned fallback. The Xray/Trojan tell is when a VALID HTTP probe
+    // (our "HTTP GET /" and/or "HTTP abs-URI (proxy-style)") also gets
+    // the same canned reply. We therefore only raise `canned_identical`
+    // when at least one valid-HTTP probe shares the reply.
+    struct KeyEntry { string line; int bytes; const char* name; };
+    vector<KeyEntry> keys;
+    for (auto& p: probes) {
+        if (p.responded) {
+            ++a.resp;
+            keys.push_back({p.first_line, p.bytes, p.name.c_str()});
+            bool bad_v = false;
+            bool is_http = looks_like_http_line(p.first_line, &bad_v);
+            if (is_http && !bad_v) ++a.http_real;
+            else if (is_http && bad_v) ++a.http_bad_version;
+            else                       ++a.raw_non_http;
+        } else {
+            ++a.silent;
+        }
+    }
+    // A probe name is "valid-HTTP" if it sent a well-formed HTTP request
+    // that a real web server would distinguish from junk.
+    auto is_valid_http_probe = [](const char* n) {
+        if (!n) return false;
+        return strstr(n, "HTTP GET /") != nullptr ||
+               strstr(n, "HTTP abs-URI") != nullptr;
+    };
+    // Find canned clusters: line+bytes appearing >=2 times AND including
+    // at least one valid-HTTP probe (otherwise it's just uniform 400 on
+    // malformed junk, which is the correct nginx behaviour).
+    for (size_t i=0; i<keys.size(); ++i) {
+        int count = 0;
+        bool has_valid_http = false;
+        for (size_t j=0; j<keys.size(); ++j) {
+            if (keys[i].line == keys[j].line && keys[i].bytes == keys[j].bytes) {
+                ++count;
+                if (is_valid_http_probe(keys[j].name)) has_valid_http = true;
+            }
+        }
+        if (count >= 2 && keys[i].line.size() > 3 && has_valid_http) {
+            a.canned_identical = count;
+            a.canned_line      = keys[i].line;
+            a.canned_bytes     = keys[i].bytes;
+            break;
+        }
+    }
+    return a;
 }
 
 // ============================================================================
@@ -1699,7 +2202,15 @@ struct FullReport {
     vector<TcpOpen> open_tcp;
     vector<std::pair<int,UdpResult>> udp_probes;
     // fingerprints
-    struct PortFp { int port; FpResult fp; optional<TlsProbe> tls; optional<SniConsistency> sni; vector<J3Result> j3; };
+    struct PortFp {
+        int port;
+        FpResult fp;
+        optional<TlsProbe>        tls;
+        optional<SniConsistency>  sni;
+        vector<J3Result>          j3;
+        optional<J3Analysis>      j3a;   // v2.3 — J3 response analysis
+        optional<HttpsProbe>      https; // v2.3 — active HTTP-over-TLS probe
+    };
     vector<PortFp> fps;
     UdpResult quic;
     // verdict
@@ -1757,19 +2268,23 @@ static FullReport run_full_target(const string& target) {
     for (auto& ip: R.dns.ips) printf("%s ", ip.c_str());
     printf(" [%s, %lldms]\n", R.dns.family.c_str(), R.dns.ms);
 
-    // 2) GeoIP — 6 sources in parallel (EU/global + RU)
-    printf("\n%s[2/7] GeoIP%s  (6 providers in parallel)\n", col(C::BOLD), col(C::RST));
-    auto fg1 = std::async(std::launch::async, geo_ipapi_is,   R.dns.primary_ip);
-    auto fg2 = std::async(std::launch::async, geo_iplocate,   R.dns.primary_ip);
-    auto fg3 = std::async(std::launch::async, geo_ip_api_com, R.dns.primary_ip);
-    auto fg4 = std::async(std::launch::async, geo_ipwho_is,   R.dns.primary_ip);
-    auto fg5 = std::async(std::launch::async, geo_ipinfo_io,  R.dns.primary_ip);
-    auto fg6 = std::async(std::launch::async, geo_freeipapi,  R.dns.primary_ip);
-    auto fg7 = std::async(std::launch::async, geo_2ip_ru,     R.dns.primary_ip);
-    R.geos.push_back(fg1.get()); R.geos.push_back(fg2.get());
-    R.geos.push_back(fg3.get()); R.geos.push_back(fg4.get());
-    R.geos.push_back(fg5.get()); R.geos.push_back(fg6.get());
-    R.geos.push_back(fg7.get());
+    // 2) GeoIP — 3 EU + 3 RU + 3 global providers, all in parallel.
+    //    Diversity matters: EU and RU providers often disagree on hosting/
+    //    VPN flags and the disagreement itself is diagnostic.
+    printf("\n%s[2/7] GeoIP%s  (9 providers in parallel: 3 EU / 3 RU / 3 global)\n",
+           col(C::BOLD), col(C::RST));
+    auto fg_eu1 = std::async(std::launch::async, geo_ipapi_is,   R.dns.primary_ip); // EU (Latvia)
+    auto fg_eu2 = std::async(std::launch::async, geo_iplocate,   R.dns.primary_ip); // EU (NL)
+    auto fg_eu3 = std::async(std::launch::async, geo_freeipapi,  R.dns.primary_ip); // EU
+    auto fg_ru1 = std::async(std::launch::async, geo_2ip_ru,     R.dns.primary_ip); // RU
+    auto fg_ru2 = std::async(std::launch::async, geo_ipapi_ru,   R.dns.primary_ip); // RU (ip-api.com/ru)
+    auto fg_ru3 = std::async(std::launch::async, geo_sypex,      R.dns.primary_ip); // RU (sypexgeo)
+    auto fg_gl1 = std::async(std::launch::async, geo_ip_api_com, R.dns.primary_ip); // global
+    auto fg_gl2 = std::async(std::launch::async, geo_ipwho_is,   R.dns.primary_ip); // global
+    auto fg_gl3 = std::async(std::launch::async, geo_ipinfo_io,  R.dns.primary_ip); // global
+    R.geos.push_back(fg_eu1.get()); R.geos.push_back(fg_eu2.get()); R.geos.push_back(fg_eu3.get());
+    R.geos.push_back(fg_ru1.get()); R.geos.push_back(fg_ru2.get()); R.geos.push_back(fg_ru3.get());
+    R.geos.push_back(fg_gl1.get()); R.geos.push_back(fg_gl2.get()); R.geos.push_back(fg_gl3.get());
     for (auto& g: R.geos) print_geo(g);
 
     // 3) TCP scan
@@ -1881,7 +2396,10 @@ static FullReport run_full_target(const string& target) {
                 // SNI consistency
                 SniConsistency sc = sni_consistency(R.dns.primary_ip, o.port, R.dns.host);
                 pf.sni = sc;
-                if (sc.reality_like) {
+                if (sc.reality_like && sc.passthrough_mode) {
+                    printf("        %sSNI behaviour: cert varies per SNI BUT base cert is for brand '%s' — Reality with real passthrough to dest= (stealth-optimised)%s\n",
+                           col(C::RED), sc.matched_foreign_sni.c_str(), col(C::RST));
+                } else if (sc.reality_like) {
                     printf("        %sSNI steering: same cert returned for ALL foreign SNIs, and cert is valid for '%s' -> Reality/XTLS pattern%s\n",
                            col(C::GRN), sc.matched_foreign_sni.c_str(), col(C::RST));
                 } else if (sc.default_cert_only) {
@@ -1898,6 +2416,38 @@ static FullReport run_full_target(const string& target) {
                     printf("        cert-sha256: %s%.16s...%s  issuer: %s\n",
                            col(C::DIM), sc.base_sha.c_str(), col(C::RST),
                            printable_prefix(tp.cert_issuer, 60).c_str());
+                }
+                // v2.3 — active HTTP-over-TLS probe: what does the origin
+                // actually emit as an HTTP reply? Real nginx → 'HTTP/1.1 200
+                // ...\r\nServer: nginx'. Xray fallback → 'HTTP/0.0 307 ...'
+                // or empty. Trojan → TLS handshake ok but HTTP returns
+                // nothing or the dest='s real page (detectable).
+                HttpsProbe hp = https_probe(R.dns.primary_ip, o.port, R.dns.host);
+                pf.https = hp;
+                if (hp.tls_ok) {
+                    if (hp.responded) {
+                        printf("        %sHTTP-over-TLS:%s %s%s%s",
+                               col(C::DIM), col(C::RST),
+                               hp.version_anomaly ? col(C::RED) :
+                                 (hp.status_code>=200 && hp.status_code<600 ? col(C::GRN) : col(C::YEL)),
+                               printable_prefix(hp.first_line, 70).c_str(),
+                               col(C::RST));
+                        if (!hp.server_hdr.empty())
+                            printf("   Server: %s%s%s",
+                                   col(C::CYN),
+                                   printable_prefix(hp.server_hdr, 40).c_str(),
+                                   col(C::RST));
+                        else if (hp.status_code > 0)
+                            printf("   %s(no Server header)%s",
+                                   col(C::YEL), col(C::RST));
+                        if (hp.version_anomaly)
+                            printf("   %s[!version anomaly]%s",
+                                   col(C::RED), col(C::RST));
+                        printf("\n");
+                    } else {
+                        printf("        %sHTTP-over-TLS: no reply (TLS ok, origin silent on HTTP request) — stream-layer proxy signature%s\n",
+                               col(C::RED), col(C::RST));
+                    }
                 }
             } else {
                 FpResult f; f.service = "TLS-FAIL";
@@ -1957,8 +2507,15 @@ static FullReport run_full_target(const string& target) {
             }
             printf("\n");
         }
+        // v2.3 — compute + cache J3 analysis (canned responses, HTTP-version
+        // anomalies, raw-non-HTTP replies) so the verdict engine can use it.
+        J3Analysis ja = j3_analyze(probes);
         // attach
-        for (auto& pf: R.fps) if (pf.port == o.port) { pf.j3 = std::move(probes); break; }
+        for (auto& pf: R.fps) if (pf.port == o.port) {
+            pf.j3  = std::move(probes);
+            pf.j3a = ja;
+            break;
+        }
         const char* verdict;
         // NB: silent-on-junk is not a positive ID — ANY strict TLS endpoint
         // (nginx, Apache, CDN, etc.) drops HTTP/junk before the TLS record
@@ -1970,34 +2527,97 @@ static FullReport run_full_target(const string& target) {
         else                  verdict = "mixed behaviour";
         printf("     %s-> %s%s  (silent=%d / resp=%d)\n",
                col(C::MAG), verdict, col(C::RST), silent, resp);
+        // v2.3 — J3 deep-analysis summary printed inline so the user SEES
+        // the reasoning instead of waiting for the verdict block.
+        //   On TLS ports, a canned 400 to raw-TCP probes is normal nginx
+        //   behaviour; only escalate if the HTTP-over-TLS probe ALSO showed
+        //   anomaly. See matching gate in the verdict engine.
+        bool inline_is_tls = false, inline_https_anomaly = false;
+        for (auto& pf: R.fps) if (pf.port == o.port) {
+            inline_is_tls = (pf.tls && pf.tls->ok);
+            if (pf.https && pf.https->tls_ok &&
+                (!pf.https->responded || pf.https->version_anomaly ||
+                 (pf.https->responded && pf.https->server_hdr.empty())))
+                inline_https_anomaly = true;
+            break;
+        }
+        bool inline_canned_hard = (ja.canned_identical >= 2) &&
+                                  (!inline_is_tls || inline_https_anomaly);
+        if (inline_canned_hard) {
+            printf("     %s!! canned response:%s the SAME first-line (%dB '%s') came back for %d different probes — not a real web server, that's a static fallback page (classic Xray `fallback+redirect`, Trojan, or Caddy placeholder)\n",
+                   col(C::RED), col(C::RST),
+                   ja.canned_bytes,
+                   printable_prefix(ja.canned_line, 50).c_str(),
+                   ja.canned_identical);
+        } else if (ja.canned_identical >= 2 && inline_is_tls) {
+            printf("     %suniform reply:%s the SAME first-line (%dB '%s') for %d raw-TCP probes, but the HTTP-over-TLS probe is clean — that's normal nginx/CDN behaviour on a TLS port (not a fallback)\n",
+                   col(C::DIM), col(C::RST),
+                   ja.canned_bytes,
+                   printable_prefix(ja.canned_line, 50).c_str(),
+                   ja.canned_identical);
+        }
+        if (ja.http_bad_version > 0) {
+            printf("     %s!! HTTP version anomaly:%s %d probe(s) came back with an invalid HTTP version string (e.g. HTTP/0.0) — signature of a stream-proxy's fallback/redirect code path, not of nginx/Apache/Caddy\n",
+                   col(C::RED), col(C::RST), ja.http_bad_version);
+        }
+        if (ja.raw_non_http > 0 && ja.http_real == 0) {
+            printf("     %s!! raw non-HTTP bytes:%s %d probe(s) got binary replies instead of HTTP — origin is speaking its own framing (Shadowsocks, Trojan, custom proxy)\n",
+                   col(C::YEL), col(C::RST), ja.raw_non_http);
+        }
     }
 
-    // 7) Verdict engine (v2.2 — accumulative red-flag model)
+    // 7) Verdict engine (v2.3 — deep-audit model)
     //
-    // Rules:
-    //   * A "stack" is only named on strong protocol-level evidence:
-    //     Reality cert-steering + TLS, OpenVPN wire protocol on UDP,
-    //     WireGuard default port answering a real handshake, etc.
-    //   * Every soft signal (hosting-ASN, fresh cert, single open port,
-    //     free-CA issuer, SSH on 22, weak TLS, SNI-anomaly, etc.) adds a
-    //     red flag. Red flags do not rename the stack but cumulatively
-    //     push the score down.
-    //   * 3+ independent red flags trigger a COMBO penalty — the pattern
-    //     as a whole starts to look like a single-purpose proxy host even
-    //     if no single signal is conclusive.
-    //   * A dedicated DPI exposure matrix at the end shows exactly by
-    //     which axis the host can be classified.
+    // v2.3 adds ACTIVE on-the-wire signals that are extremely expensive for
+    // a legit web origin to fake but trivially show up in any Xray/Trojan/
+    // Reality deployment:
+    //
+    //   * Cert impersonation — famous-brand CN (amazon/microsoft/apple/...)
+    //     on an ASN that has no commercial relationship with that brand.
+    //     This is the Reality "static dest" profile (dest=www.amazon.com:443)
+    //     and it's a hard signal because the only way a random VPS in LV on
+    //     AS42532 serves a valid Amazon cert is by proxying the TLS
+    //     handshake to the real amazon.com.
+    //
+    //   * Short-validity cert — total_validity_days < 14 is never normal.
+    //     Let's Encrypt issues 90d certs, commercial CAs 30-365d. A cert
+    //     with 6 days of total lifetime is either LE staging (not used by
+    //     real sites), manually generated for a proxy, or chain rot.
+    //
+    //   * Canned-response fallback — if two or more J3 probes get back
+    //     EXACTLY the same first-line + byte count, the origin isn't a
+    //     real web server, it's a stream-proxy handing out a static
+    //     fallback page on every mismatch. Xray's `fallback+redirect`
+    //     famously emits "HTTP/0.0 307 Temporary Redirect".
+    //
+    //   * HTTP-version anomaly — a response line of HTTP/0.X or HTTP/3.X
+    //     (text) etc. never comes out of nginx/Apache/Caddy; it's a
+    //     proxy-specific serialiser.
+    //
+    //   * 3x-ui / x-ui port cluster — panel installers use a stock set of
+    //     Cloudflare-proxy-friendly TLS ports (2053 / 2083 / 2087 / 2096 /
+    //     8443 / 8880). Two or more of these on one IP is a panel-install
+    //     signature.
+    //
+    //   * HTTP-over-TLS response audit — after a clean TLS handshake we
+    //     actually speak HTTP/1.1 and look for a real Server: header.
+    //     No Server: header AND HTTP version anomaly AND/or empty response
+    //     = stream-layer proxy.
+    //
+    // Calibration: hosting-ASN, single :443, IKE control ports,
+    // single-source GeoIP tags, KEX != X25519 etc. stay informational
+    // with hardening advice (not a penalty on their own).
     // ------------------------------------------------------------------
     printf("\n%s[7/7] Verdict%s\n", col(C::BOLD), col(C::RST));
     int score = 100;
-    vector<string> signals_major;  // strong: named VPN protocol, proxy,
-                                   // Tor exit, VPN-flagged by multiple
-                                   // sources
-    vector<string> signals_minor;  // soft: hosting-ASN, fresh cert,
-                                   // sparse open-port profile, free-CA,
-                                   // ALPN != h2, etc.
-    vector<std::pair<int,string>> port_roles; // (port, role label)
-    vector<std::pair<string,string>> dpi_axes; // (axis, exposure-string)
+    vector<string> signals_major;  // hard evidence: named VPN, open
+                                   // proxy, multi-source tag, Tor, etc.
+    vector<string> signals_minor;  // soft evidence: fresh cert in combo,
+                                   // self-signed, TLS<1.3, Reality, etc.
+    vector<std::pair<string,string>> notes;   // (tag, observation)  — no penalty
+    vector<std::pair<string,string>> hardening; // (tag, advice)
+    vector<std::pair<int,string>>    port_roles; // (port, role label)
+    vector<std::pair<string,string>> dpi_axes;   // (axis, exposure)
     bool xray_reality_primary = false, xray_reality_hidden = false;
     int  reality_port_count   = 0;
 
@@ -2009,8 +2629,12 @@ static FullReport run_full_target(const string& target) {
         signals_major.push_back(s);
         score -= penalty;
     };
+    auto note = [&](const string& tag, const string& s) {
+        notes.push_back({tag, s});
+    };
 
     // ---- GeoIP signals ---------------------------------------------
+    // v2.3: hosting-ASN and single-source VPN tags are informational only.
     int vpn_hits = 0, proxy_hits = 0, hosting_hits = 0, tor_hits = 0;
     for (auto& g: R.geos) {
         if (g.is_hosting) ++hosting_hits;
@@ -2018,29 +2642,31 @@ static FullReport run_full_target(const string& target) {
         if (g.is_proxy)   ++proxy_hits;
         if (g.is_tor)     ++tor_hits;
     }
+    int gprov = (int)R.geos.size();
     if (tor_hits)
         flag_major("flagged as Tor exit by " + std::to_string(tor_hits) + " GeoIP source(s)", 25);
     if (vpn_hits >= 2)
-        flag_major("flagged as VPN by " + std::to_string(vpn_hits) + " GeoIP sources", 18);
+        flag_major("flagged as VPN by " + std::to_string(vpn_hits) + " GeoIP sources (multi-source consensus)", 18);
     else if (vpn_hits == 1)
-        flag_minor("flagged as VPN by 1 GeoIP source (weak — single-source)", 8);
+        note("geo-vpn", "1 of " + std::to_string(gprov) + " GeoIP sources tagged this IP as VPN (single-source — likely a false positive)");
     if (proxy_hits >= 2)
-        flag_major("flagged as proxy by " + std::to_string(proxy_hits) + " GeoIP sources", 12);
+        flag_major("flagged as proxy by " + std::to_string(proxy_hits) + " GeoIP sources (multi-source consensus)", 12);
     else if (proxy_hits == 1)
-        flag_minor("flagged as proxy by 1 GeoIP source", 5);
-    if (hosting_hits >= 3)
-        flag_minor("hosting/datacenter ASN confirmed by " + std::to_string(hosting_hits) + " sources", 5);
-    else if (hosting_hits >= 1)
-        flag_minor("hosting/datacenter ASN (" + std::to_string(hosting_hits) + " source(s))", 3);
+        note("geo-proxy", "1 of " + std::to_string(gprov) + " GeoIP sources tagged this IP as proxy (single-source — likely a false positive)");
+    if (hosting_hits >= 1)
+        note("asn-hosting", std::to_string(hosting_hits) + " of " + std::to_string(gprov) + " sources classify the ASN as hosting/datacenter "
+             "(normal for any public server — not a red flag on its own)");
     if (R.geos.size() >= 2 && !R.geos[0].country_code.empty() && !R.geos[1].country_code.empty()
         && R.geos[0].country_code != R.geos[1].country_code)
-        flag_minor("country-code mismatch between GeoIP sources (geolocation inconsistency)", 3);
+        note("geo-cc-mismatch", "GeoIP country codes disagree between providers (normal GeoIP noise)");
 
     // ---- TCP exposure signals --------------------------------------
+    // v2.3: only truly VPN/proxy-specific ports carry a penalty.
+    // "Only :443 open" / "SSH/22 open" are NORMAL for a public web host —
+    // moved to Informational with a Hardening entry.
     set<int> openset;
     for (auto& o: R.open_tcp) openset.insert(o.port);
-    if (openset.count(22))   flag_minor("SSH/22 exposed (ASN classifier marks host as VPS/server)", 5);
-    if (openset.count(3389)) flag_major("RDP/3389 exposed to Internet (attack surface + server profile)", 10);
+    if (openset.count(3389)) flag_major("RDP/3389 reachable from Internet (attack surface, not VPN-specific)", 10);
     if (openset.count(1080) || openset.count(1081))
         flag_major("SOCKS5 exposed without wrapper (proxy signature)", 15);
     if (openset.count(3128) || openset.count(8118))
@@ -2051,12 +2677,15 @@ static FullReport run_full_target(const string& target) {
         flag_major("Shadowsocks default port exposed (instantly fingerprintable)", 15);
     if (openset.count(10808) || openset.count(10809) || openset.count(10810))
         flag_major("v2ray/xray local-style inbound port exposed to WAN (misconfig)", 12);
+    // Informational — not red flags, but we surface actionable hardening:
+    if (openset.count(22))
+        note("ssh-22", "SSH/22 open with a standard banner — visible on Shodan/ASN-sweeps as 'server host', not as VPN");
     if (openset.count(500) || openset.count(4500))
-        flag_minor("IKE control ports open (500/4500) — IPsec/IKEv2 posture", 4);
+        note("ike-ports", "IKE control ports (500/4500) open — normal for any IPsec-capable router");
     if (openset.count(443) && R.open_tcp.size() == 1)
-        flag_minor("single open port profile: :443 only — common reverse-proxy / VLESS-Reality front", 5);
+        note("single-443", "only :443 is reachable — indistinguishable from a typical reverse-proxy / corporate single-service host, but provides no web 'context' (no :80 redirect, no decoy services)");
     else if (openset.count(443) && R.open_tcp.size() <= 3 && hosting_hits)
-        flag_minor("sparse open-port profile (<=3 ports) on hosting ASN with :443 open — VPS-proxy profile", 4);
+        note("sparse-ports", std::to_string(R.open_tcp.size()) + " TCP ports open on a hosting ASN with :443 — sparse profile; common for both minimal corporate servers and single-purpose proxy VPSes");
 
     // ---- UDP handshake signals -------------------------------------
     for (auto& [p,u]: R.udp_probes) {
@@ -2068,81 +2697,296 @@ static FullReport run_full_target(const string& target) {
         if (p == 41641) flag_minor("Tailscale UDP/41641 answers handshake (default port)", 5);
     }
 
-    // ---- TLS posture + cert red flags ------------------------------
-    bool any_tls = false, any_reality = false, plain_tls_on_443 = false;
+    // ---- 3x-ui / x-ui / panel-installer port-cluster signature (v2.3) ---
+    //   Cloudflare proxy-friendly TLS ports 2053/2083/2087/2096/8443/8880
+    //   are what 3x-ui/x-ui/V2bX/Marzban panels suggest by default. Two or
+    //   more of them open together on one IP is an installer fingerprint
+    //   that regular webhosts do not produce.
+    int xui_cluster_hits = 0;
+    vector<int> xui_open;
+    for (int p: {2053, 2083, 2087, 2096, 8443, 8880, 6443, 7443, 9443}) {
+        if (openset.count(p)) { ++xui_cluster_hits; xui_open.push_back(p); }
+    }
+    bool xui_cluster_seen = false;
+    if (xui_cluster_hits >= 2) {
+        string portstr;
+        for (size_t i=0;i<xui_open.size();++i) {
+            if (i) portstr += ",";
+            portstr += std::to_string(xui_open[i]);
+        }
+        flag_major(std::to_string(xui_cluster_hits) + " of the classical 3x-ui/x-ui/Marzban panel TLS ports are open ({" + portstr + "}) — installer fingerprint; regular webhosts rarely open this exact set", 14);
+        xui_cluster_seen = true;
+    } else if (xui_cluster_hits == 1) {
+        note("xui-single-port", "one panel-installer TLS port open (:" + std::to_string(xui_open[0]) +
+             ") — ambiguous by itself, but these ports are strongly associated with 3x-ui/x-ui proxy panels");
+    }
+
+    // ---- Silent-high-port + TLS elsewhere (v2.3 multipath detector) -----
+    //   A classic Xray multi-inbound setup exposes :443 (TLS-fronted VLESS)
+    //   AND a silent high port (direct VLESS/Trojan listener). That high
+    //   port accepts TCP, says nothing on connect, doesn't speak TLS, and
+    //   dies on any junk.  Real business services don't look like that.
+    int silent_high_ports = 0;
+    for (auto& o: R.open_tcp) {
+        if (o.port >= 10000 && o.banner.empty()) ++silent_high_ports;
+    }
+    bool tls_on_443 = openset.count(443) > 0;
+    if (tls_on_443 && silent_high_ports >= 1 && R.open_tcp.size() <= 6) {
+        flag_minor(std::to_string(silent_high_ports) + " silent high-port(s) open alongside :443 TLS on a sparse host — classic multi-inbound proxy layout (Xray VLESS :443 + direct listener on high port)", 7);
+    }
+
+    // ---- TLS posture + cert red flags (v2.3 — adds impersonation/short-validity)
+    //   * TLS<1.3 is still a weak-posture penalty (real 2026 sites are TLS1.3).
+    //   * ALPN != h2 and KEX != X25519 → informational only, not a penalty.
+    //   * Fresh cert <14d → penalty ONLY if the host also has (sparse-ports
+    //     profile AND hosting ASN). An isolated fresh LE cert on a
+    //     multi-port corporate host is just normal LE rotation.
+    //   * Self-signed, expired, zero-SAN — still red flags (not normal).
+    //   * total_validity_days < 14 — HARD flag (no legit CA issues <14d).
+    //   * brand cert on non-brand ASN — HARD flag (Reality-static profile).
+    bool any_tls = false, any_reality = false;
+    bool any_impersonation = false;
     int  cert_issuers_seen_free_ca = 0;
     int  cert_fresh_ports = 0;
     int  cert_self_signed_ports = 0;
+    int  cert_short_validity_ports = 0;
+    int  cert_impersonation_ports = 0;
     int  tls_not_13_ports = 0;
     int  alpn_not_h2_ports = 0;
     int  group_not_x25519_ports = 0;
+    bool sparse_vps_profile = (openset.count(443) && R.open_tcp.size() <= 3 && hosting_hits > 0);
+
+    // collect all ASN-org strings across providers for brand cross-check
+    vector<string> asn_orgs_all;
+    for (auto& g: R.geos) if (!g.asn_org.empty()) asn_orgs_all.push_back(g.asn_org);
     for (auto& pf: R.fps) {
         if (pf.tls && pf.tls->ok) {
             any_tls = true;
             if (pf.tls->version != "TLSv1.3") {
                 flag_minor("TLS < 1.3 on :" + std::to_string(pf.port) +
-                           " (" + pf.tls->version + ") — weak handshake posture", 4);
+                           " (" + pf.tls->version + ") — weak handshake posture, modern clients expect TLS 1.3", 4);
                 ++tls_not_13_ports;
             }
             if (pf.tls->alpn != "h2") {
-                flag_minor("ALPN != h2 on :" + std::to_string(pf.port) +
-                           " (got '" + (pf.tls->alpn.empty()?"-":pf.tls->alpn) +
-                           "') — unlike a real h2/CDN front", 2);
+                note("alpn", "ALPN on :" + std::to_string(pf.port) + " = '" +
+                     (pf.tls->alpn.empty() ? "-" : pf.tls->alpn) +
+                     "' (HTTP/1.1-only is still normal for many corporate apps; h2 is not mandatory)");
                 ++alpn_not_h2_ports;
             }
             if (!pf.tls->group.empty() && pf.tls->group != "X25519") {
-                flag_minor("KEX group != X25519 on :" + std::to_string(pf.port) +
-                           " (" + pf.tls->group + ") — atypical for modern clients", 2);
+                note("kex", "KEX group on :" + std::to_string(pf.port) + " = '" + pf.tls->group +
+                     "' (X25519 is preferred by modern browsers but ECDHE-P256 is perfectly valid)");
                 ++group_not_x25519_ports;
             }
             if (pf.tls->age_days > 0 && pf.tls->age_days < 14) {
-                flag_minor("cert on :" + std::to_string(pf.port) +
-                           " is fresh (" + std::to_string(pf.tls->age_days) +
-                           "d) — common fingerprint of a newly-provisioned proxy / Reality host", 4);
                 ++cert_fresh_ports;
-            } else if (pf.tls->age_days >= 14 && pf.tls->age_days < 45 && hosting_hits) {
-                flag_minor("cert on :" + std::to_string(pf.port) +
-                           " is relatively young (" + std::to_string(pf.tls->age_days) +
-                           "d) on a hosting ASN — weak signal", 2);
+                if (sparse_vps_profile) {
+                    flag_minor("cert on :" + std::to_string(pf.port) +
+                               " is fresh (" + std::to_string(pf.tls->age_days) +
+                               "d) AND open-port profile is sparse on hosting ASN — classic 'new VLESS host' fingerprint",
+                               6);
+                } else {
+                    note("cert-fresh", "cert on :" + std::to_string(pf.port) + " is " +
+                         std::to_string(pf.tls->age_days) + "d old (fresh LE certs are normal for any site rotating every 60-90d)");
+                }
             }
             if (pf.tls->self_signed) {
                 flag_major("self-signed cert on :" + std::to_string(pf.port) +
-                           " (subject==issuer) — browsers would reject; typical of Shadowsocks/Trojan setups", 10);
+                           " (subject==issuer) — browsers would reject; typical of Shadowsocks/Trojan/test setups", 10);
                 ++cert_self_signed_ports;
             }
             if (pf.tls->is_letsencrypt) {
                 ++cert_issuers_seen_free_ca;
-                // no direct penalty — LE is also the default for legit small sites
+                // Not a signal — LE / ZeroSSL / GTS are the norm for public sites.
             }
             if (pf.tls->days_left < 0) {
                 flag_minor("cert on :" + std::to_string(pf.port) +
                            " EXPIRED " + std::to_string(-pf.tls->days_left) +
-                           "d ago — nobody real runs this, strong abandonment/proxy signal", 8);
+                           "d ago — no legit site runs an expired cert; abandonment or misconfig signal", 8);
             }
             if (pf.tls->san_count == 0 && !pf.tls->subject_cn.empty()) {
-                flag_minor("cert on :" + std::to_string(pf.port) +
-                           " has no SAN entries (only legacy CN) — unusual for modern public TLS", 3);
+                note("no-san", "cert on :" + std::to_string(pf.port) +
+                     " has no SAN entries (only legacy CN) — unusual for modern public TLS, but some internal certs do this");
+            }
+            // v2.3 — short-validity cert: total lifetime < 14d is never
+            // issued by real CAs to production sites. LE = 90d, commercial
+            // = 30-365d. 5-14d means manually-generated internal cert or
+            // LE staging, used by Xray/Trojan quickfire setups.
+            if (pf.tls->total_validity_days > 0 && pf.tls->total_validity_days < 14) {
+                flag_major("cert on :" + std::to_string(pf.port) +
+                           " has a total validity of only " + std::to_string(pf.tls->total_validity_days) +
+                           " days (notBefore→notAfter) — no public CA issues <14d certs to real sites; this is a hand-rolled internal cert or LE staging, a hard signal of a proxy/test setup",
+                           15);
+                ++cert_short_validity_ports;
+            }
+        }
+        // v2.3 — brand impersonation check:
+        // If the cert vouches for a famous brand but the ASN clearly has
+        // nothing to do with that brand, this is Reality-static / cert
+        // cloning. This is a HARD signal (the only reason a random VPS in
+        // US on AS56971 serves a valid Amazon cert is because it's
+        // proxying the handshake).
+        if (pf.sni && pf.sni->cert_impersonation && !pf.sni->brand_claimed.empty()) {
+            bool owns = asn_owns_brand(pf.sni->brand_claimed, asn_orgs_all);
+            if (!owns) {
+                flag_major("cert on :" + std::to_string(pf.port) +
+                           " vouches for brand '" + pf.sni->brand_claimed +
+                           "' but the ASN is not owned by that brand — Reality-static / "
+                           "cert-cloning signature (Xray `dest=" + pf.sni->brand_claimed + "` profile)",
+                           22);
+                ++cert_impersonation_ports;
+                any_impersonation = true;
+            } else {
+                // legit brand on legit ASN — no signal
+                note("brand-legit", "cert on :" + std::to_string(pf.port) +
+                     " is for '" + pf.sni->brand_claimed + "' and the ASN does match that brand — legitimate brand endpoint");
             }
         }
         if (pf.sni && pf.sni->reality_like) {
             any_reality = true;
             ++reality_port_count;
             // Reality IS identifiable — the very fact we can recognise it
-            // as Reality means a DPI engine can too. Small penalty.
-            flag_major("Reality cert-steering pattern on :" + std::to_string(pf.port) +
-                       " (cert covers foreign SNI '" + pf.sni->matched_foreign_sni + "')", 8);
+            // as Reality means a DPI engine can too.
+            if (pf.sni->passthrough_mode) {
+                flag_major("Reality in passthrough mode on :" + std::to_string(pf.port) +
+                           " (base cert is for '" + pf.sni->matched_foreign_sni +
+                           "' — stream tunnelled to the real brand, SNI-based vhost routing "
+                           "then returns different certs per SNI; cert + ASN disagree)", 14);
+            } else {
+                flag_major("Reality cert-steering pattern on :" + std::to_string(pf.port) +
+                           " (cert covers foreign SNI '" + pf.sni->matched_foreign_sni + "')", 12);
+            }
+        }
+        // v2.3 — Server-header brand impersonation. CloudFront / AmazonS3 /
+        // gws / Microsoft-IIS / Yandex banners are only served by the real
+        // brand's infrastructure. If the IP we're hitting answers with one
+        // of those but the ASN doesn't own the brand — the box is proxying
+        // the HTTP stream to the real brand (Reality passthrough). This
+        // doubles as an independent confirmation of cert impersonation, but
+        // fires even when the TLS-cert check missed it (e.g. brand not in
+        // SAN but server-banner still leaks through).
+        if (pf.https && pf.https->tls_ok && pf.https->responded &&
+            !pf.https->server_hdr.empty()) {
+            string sbr = server_header_brand(pf.https->server_hdr);
+            if (!sbr.empty()) {
+                bool owns = asn_owns_brand(sbr, asn_orgs_all);
+                if (!owns) {
+                    flag_major("HTTP-over-TLS on :" + std::to_string(pf.port) +
+                               " returns `Server: " + printable_prefix(pf.https->server_hdr, 40) +
+                               "` — that banner is only emitted by '" + sbr +
+                               "' infrastructure, yet the ASN isn't owned by that brand "
+                               "(origin is proxying the HTTP stream to the real brand = Reality passthrough)",
+                               18);
+                    // Also count this toward the cert-impersonation side if the
+                    // TLS-cert check didn't catch the same brand already.
+                    if (!(pf.sni && pf.sni->cert_impersonation)) {
+                        ++cert_impersonation_ports;
+                        any_impersonation = true;
+                    }
+                }
+            }
+        }
+        // v2.3 — Active HTTP-over-TLS probe verdicts.
+        //   * version anomaly (HTTP/0.0 etc.) = hard fake-server signal
+        //   * no Server: header AND responded = likely middleware/proxy
+        //   * TLS ok but HTTP empty = stream-layer proxy
+        if (pf.https && pf.https->tls_ok) {
+            if (pf.https->version_anomaly && pf.https->responded) {
+                flag_major("HTTP-over-TLS on :" + std::to_string(pf.port) +
+                           " returned an invalid HTTP version ('" +
+                           printable_prefix(pf.https->first_line, 40) +
+                           "') — no real web server emits that; classic Xray/Trojan fallback signature",
+                           14);
+            }
+            if (pf.https->responded && pf.https->server_hdr.empty() && !pf.https->version_anomaly) {
+                flag_minor("HTTP-over-TLS on :" + std::to_string(pf.port) +
+                           " responded without a Server: header — real nginx/Apache/Caddy/CDN set one; absence is a middleware tell",
+                           5);
+            }
+            if (!pf.https->responded) {
+                flag_minor("HTTP-over-TLS on :" + std::to_string(pf.port) +
+                           " — TLS handshake succeeded but origin did not return any HTTP bytes to a valid GET / request. Legitimate web origins always reply (200/301/404/502). Silence here = stream-layer proxy.",
+                           8);
+            }
         }
     }
 
     // ---- J3 active-probe roles -------------------------------------
+    // v2.3: re-add the "proxy in front of origin" detection.
+    //   * nginx/Apache/Caddy return HTTP/1.1 400 Bad Request (or similar
+    //     4xx) on non-TLS bytes hitting a TLS port. Most CDNs do too.
+    //   * A host that does TLS 1.3 cleanly but silently eats every
+    //     HTTP-junk probe is almost certainly running a stream-layer
+    //     proxy (Xray/Reality/Trojan/SS-AEAD) that drops anything not
+    //     matching its own framing. This is NOT Reality cert-steering
+    //     (which would require the cert discriminator to fire), but it
+    //     IS strong evidence of middleware between you and the origin.
     int j3_silent_total = 0, j3_resp_total = 0, j3_ports_checked = 0;
+    int j3_canned_ports = 0, j3_badver_ports = 0, j3_raw_nonhttp_ports = 0;
+    bool proxy_middleware_seen = false;
     for (auto& pf: R.fps) {
         if (pf.j3.size() < 6) continue;
         ++j3_ports_checked;
         int sil = 0, rsp = 0;
-        for (auto& j: pf.j3) { if (j.responded) ++rsp; else ++sil; }
+        // Also: among responses, count how many look like real HTTP (start with "HTTP/")
+        int http_like_responses = 0;
+        for (auto& j: pf.j3) {
+            if (j.responded) {
+                ++rsp;
+                if (j.first_line.rfind("HTTP/", 0) == 0) ++http_like_responses;
+            } else {
+                ++sil;
+            }
+        }
         j3_silent_total += sil;
         j3_resp_total   += rsp;
+
+        // v2.3 — tap the J3 analysis for canned/anomaly signals.
+        //   * On TLS ports, the ACTIVE HTTP-over-TLS probe is the
+        //     authoritative canned-fallback signal (post-TLS decode).
+        //     Raw-TCP canned replies to a TLS port are legitimate nginx
+        //     behaviour ("you sent non-TLS, here's 400"); we only escalate
+        //     the raw-TCP canned on a TLS port if the HTTPS-over-TLS probe
+        //     ALSO shows anomaly (empty/version-anomaly/no-Server).
+        //   * On non-TLS ports, canned identical replies to different
+        //     probes including valid HTTP GET / are hard Xray fallback.
+        bool is_tls_port        = (pf.tls && pf.tls->ok);
+        bool https_probe_anomaly =
+            (pf.https && pf.https->tls_ok &&
+             (!pf.https->responded ||
+              pf.https->version_anomaly ||
+              (pf.https->responded && pf.https->server_hdr.empty())));
+        bool canned_real = (pf.j3a && pf.j3a->canned_identical >= 2) &&
+                           (!is_tls_port || https_probe_anomaly);
+        if (canned_real) {
+            ++j3_canned_ports;
+            flag_major("port :" + std::to_string(pf.port) +
+                       " returns a canned fallback page (same first-line '" +
+                       printable_prefix(pf.j3a->canned_line, 50) +
+                       "' with identical byte count " + std::to_string(pf.j3a->canned_bytes) +
+                       "B for " + std::to_string(pf.j3a->canned_identical) +
+                       " different probes" +
+                       (is_tls_port ? " AND the HTTP-over-TLS probe is also anomalous" : "") +
+                       ") — real web servers vary their replies; this is the Xray/Trojan `fallback+redirect` signature",
+                       18);
+        }
+        if (pf.j3a) {
+            if (pf.j3a->http_bad_version >= 1) {
+                ++j3_badver_ports;
+                flag_major("port :" + std::to_string(pf.port) +
+                           " emits an HTTP reply with an invalid version (e.g. HTTP/0.0) " +
+                           std::to_string(pf.j3a->http_bad_version) +
+                           " time(s) — nginx/Apache/Caddy never produce this; classic Xray fallback signature",
+                           14);
+            }
+            if (pf.j3a->raw_non_http >= 2 && pf.j3a->http_real == 0) {
+                ++j3_raw_nonhttp_ports;
+                flag_minor("port :" + std::to_string(pf.port) +
+                           " answers with raw non-HTTP bytes (" + std::to_string(pf.j3a->raw_non_http) +
+                           " probes) — stream-layer proxy framing (Shadowsocks/Trojan/custom)", 7);
+            }
+        }
+
         bool has_reality = pf.sni && pf.sni->reality_like;
         bool tls_ok      = pf.tls && pf.tls->ok;
         bool tls_failed  = pf.tls && !pf.tls->ok;
@@ -2161,27 +3005,93 @@ static FullReport run_full_target(const string& target) {
                 role = "Reality (TLS endpoint)";
             }
         } else if (tls_ok) {
-            if (pf.port == 443) plain_tls_on_443 = true;
-            if (rsp >= 7)
-                role = "generic HTTPS / CDN origin";
-            else
-                role = "TLS endpoint (not Reality)";
+            // *** proxy-middleware heuristic ***
+            // TLS handshake clean, but junk probes are silently dropped:
+            // a real web server (nginx/Apache/Caddy/CDN) would emit
+            // HTTP/1.1 400 for non-TLS bytes. Silent = middleware.
+            if (sil >= 6 && rsp == 0) {
+                role = "TLS endpoint that silently drops all HTTP/junk — proxy/middleware in front of origin (Xray/Trojan/SS-AEAD — nginx/Apache would return HTTP 400)";
+                flag_minor("port :" + std::to_string(pf.port) +
+                           " does TLS 1.3 cleanly but silently drops every HTTP junk probe — "
+                           "strong signature of a stream-layer proxy sitting in front of the origin "
+                           "(Xray/Trojan/SS). Normal web servers reply with HTTP 400 on non-TLS bytes.",
+                           7);
+                proxy_middleware_seen = true;
+            } else if (rsp >= 4 && http_like_responses == 0) {
+                role = "TLS endpoint that answers junk with non-HTTP replies — atypical middleware (bytes come back but not in HTTP form)";
+                flag_minor("port :" + std::to_string(pf.port) +
+                           " answered " + std::to_string(rsp) +
+                           " junk probes but none looked like HTTP — origin is not a standard web server "
+                           "(possible custom proxy framing)", 5);
+                proxy_middleware_seen = true;
+            } else if (rsp >= 7) {
+                role = "generic HTTPS / CDN origin (junk probes get HTTP 4xx as expected)";
+            } else {
+                role = "TLS endpoint (not Reality, mixed probe behaviour)";
+            }
             // enrich with cert summary
-            char buf[256] = {0};
+            bool server_brand_mismatch = false;
+            if (pf.https && pf.https->tls_ok && !pf.https->server_hdr.empty()) {
+                string sb = server_header_brand(pf.https->server_hdr);
+                if (!sb.empty() && !asn_owns_brand(sb, asn_orgs_all))
+                    server_brand_mismatch = true;
+            }
+            char buf[512] = {0};
             snprintf(buf, sizeof(buf),
-                     " — %s / ALPN=%s / CN=%s / issuer=%s / age=%dd / SAN=%d",
+                     " — %s / ALPN=%s / CN=%s / issuer=%s / age=%dd / validity=%dd / SAN=%d%s%s%s%s",
                      pf.tls->version.c_str(),
                      pf.tls->alpn.empty() ? "-" : pf.tls->alpn.c_str(),
                      pf.tls->subject_cn.empty() ? "(none)" : pf.tls->subject_cn.c_str(),
                      pf.tls->issuer_cn.empty() ? "(none)" : pf.tls->issuer_cn.c_str(),
-                     pf.tls->age_days, pf.tls->san_count);
+                     pf.tls->age_days, pf.tls->total_validity_days, pf.tls->san_count,
+                     (pf.tls->total_validity_days > 0 && pf.tls->total_validity_days < 14) ? " [!short-validity]" : "",
+                     (pf.sni && pf.sni->cert_impersonation) ? " [!brand-impersonation]" : "",
+                     server_brand_mismatch ? " [!server-impersonation]" : "",
+                     canned_real ? " [!canned-fallback]" : "");
             role += buf;
+            // Upgrade the role label for the hard-signal cases: impersonation
+            // and canned-fallback take precedence over the generic role.
+            // canned_real already accounts for TLS-port vs HTTPS-probe-anomaly.
+            bool role_upgraded = false;
+            if (pf.sni && pf.sni->cert_impersonation && !pf.sni->brand_claimed.empty()) {
+                bool owns = asn_owns_brand(pf.sni->brand_claimed, asn_orgs_all);
+                if (!owns) {
+                    const char* label = (pf.sni->passthrough_mode)
+                        ? "Reality with real passthrough (cert tunnelled from '"
+                        : "Reality-static / cert-cloning (cert impersonates '";
+                    role = string(label) + pf.sni->brand_claimed +
+                           (pf.sni->passthrough_mode
+                              ? "' via `dest=` — TLS stream transparently tunnelled) "
+                              : "' on an unrelated ASN) ") + role;
+                    role_upgraded = true;
+                }
+            }
+            // Independent channel: Server-header brand mismatch. Fires when
+            // the cert-cert-cert check missed it but `Server: CloudFront/gws/...`
+            // on a non-owner ASN still leaks the passthrough.
+            if (!role_upgraded && pf.https && pf.https->tls_ok &&
+                !pf.https->server_hdr.empty()) {
+                string sb = server_header_brand(pf.https->server_hdr);
+                if (!sb.empty() && !asn_owns_brand(sb, asn_orgs_all)) {
+                    role = "Reality with real passthrough (`Server: " +
+                           printable_prefix(pf.https->server_hdr, 24) +
+                           "` banner comes from '" + sb +
+                           "' infrastructure on non-owner ASN) " + role;
+                    role_upgraded = true;
+                }
+            }
+            if (!role_upgraded && canned_real) {
+                role = "TLS endpoint emitting canned fallback response "
+                       "(Xray/Trojan `fallback+redirect` page served for every probe) " + role;
+            }
         } else if (tls_failed && sil >= 6) {
-            role = "silent-on-junk (ambiguous: Reality-strict / SS-AEAD / Trojan / firewall)";
+            role = "TLS handshake refused AND silent on HTTP — stream-layer proxy that only speaks its own framing (Shadowsocks-AEAD / Trojan / strict-mode Reality / custom SOCKS-over-TLS) OR a firewalled service";
             flag_minor("port :" + std::to_string(pf.port) +
-                       " is silent on junk AND rejects TLS — DPI-ambiguous profile", 4);
+                       " rejects TLS AND drops HTTP junk — likely a stream-proxy that only accepts its own framing "
+                       "(SS-AEAD, Trojan, Reality-strict). Not conclusive: could also be a firewalled internal service.",
+                       5);
         } else if (tls_failed) {
-            role = "TLS handshake failed + mixed probes (ambiguous)";
+            role = "TLS handshake failed + mixed probes (ambiguous — internal service / non-TLS-on-TLS-port misconfig)";
         }
         if (!role.empty()) port_roles.push_back({pf.port, role});
     }
@@ -2214,15 +3124,9 @@ static FullReport run_full_target(const string& target) {
         }
     }
 
-    // ---- COMBO penalty ---------------------------------------------
-    int minor_count = (int)signals_minor.size();
-    if (minor_count >= 5)
-        flag_minor("[COMBO] " + std::to_string(minor_count) +
-                   " independent soft signals stack up — pattern fits a single-purpose proxy host", 12);
-    else if (minor_count >= 3)
-        flag_minor("[COMBO] " + std::to_string(minor_count) +
-                   " independent soft signals — looks like a plain VPS front, not a CDN/corporate host", 6);
-
+    // v2.3: no blanket COMBO penalty — we already combined fresh-cert
+    // with sparse-port+hosting above. Blanket combo on arbitrary minors
+    // over-penalised any minimal VPS.
     score = std::max(0, std::min(100, score));
     R.score = score;
     if (score >= 85)      R.label = "CLEAN";
@@ -2238,7 +3142,15 @@ static FullReport run_full_target(const string& target) {
                               [](auto& x){return x.first==51820 && x.second.responded;});
     bool any_ovpn_udp = std::any_of(R.udp_probes.begin(), R.udp_probes.end(),
                                     [](auto& x){return x.first==1194 && x.second.responded;});
-    if (reality_port_count >= 2)
+    bool any_canned    = (j3_canned_ports > 0);
+    bool any_bad_ver   = (j3_badver_ports  > 0);
+    bool any_short_val = (cert_short_validity_ports > 0);
+    if (any_impersonation && xui_cluster_seen)
+        stack_name = "Xray-core VLESS+Reality on a 3x-ui/x-ui/Marzban panel install "
+                     "(cert impersonates a major brand + multiple panel-preset TLS ports open)";
+    else if (any_impersonation)
+        stack_name = "Xray-core VLESS+Reality (static dest — TLS cert cloned from a major brand)";
+    else if (reality_port_count >= 2)
         stack_name = "Xray-core / sing-box (VLESS+Reality, multi-port)";
     else if (xray_reality_primary)
         stack_name = "Xray-core (VLESS+Reality with HTTP fallback)";
@@ -2246,12 +3158,24 @@ static FullReport run_full_target(const string& target) {
         stack_name = "Xray-core (VLESS+Reality, hidden-mode)";
     else if (any_reality)
         stack_name = "Xray / Reality-compatible TLS steering";
+    else if (any_canned || any_bad_ver)
+        stack_name = "TLS front + Xray/Trojan stream-layer proxy "
+                     "(canned fallback response / invalid HTTP version — not a real web server)";
+    else if (any_short_val)
+        stack_name = "TLS endpoint with a hand-rolled short-lifetime cert "
+                     "(validity < 14d — never issued by real CAs; Xray/Trojan quickfire setup)";
+    else if (xui_cluster_seen)
+        stack_name = "3x-ui/x-ui/Marzban panel install (multiple preset TLS ports open) — "
+                     "VLESS/Trojan/Shadowsocks multiplex likely";
     else if (any_ovpn_udp || openset.count(1194) || openset.count(1193))
         stack_name = "OpenVPN (plaintext wire protocol)";
     else if (any_wg)
         stack_name = "WireGuard (default UDP port)";
     else if (openset.count(8388) || openset.count(8488))
         stack_name = "Shadowsocks (naked default port)";
+    else if (proxy_middleware_seen)
+        stack_name = "TLS front + stream-layer proxy (Xray / Trojan / SS-AEAD) — TLS handshake is clean, "
+                     "but the origin silently drops non-TLS bytes instead of returning HTTP 400 like a real web server";
     else if (any_tls && openset.count(443))
         stack_name = "generic TLS / HTTPS origin (no direct VPN signature)";
     else
@@ -2276,6 +3200,15 @@ static FullReport run_full_target(const string& target) {
         dpi_axes.push_back({name, string(level) + " — " + note});
         printf("    %-36s %s%-6s%s  %s\n", name, col(c), level, col(C::RST), note.c_str());
     };
+
+    // v2.3 — aggregate HTTPS-probe / panel counters used by matrix rows.
+    int https_bad_ver_ports = 0, https_no_server_ports = 0, https_empty_ports = 0, https_ok_real_ports = 0;
+    for (auto& pf: R.fps) if (pf.https && pf.https->tls_ok) {
+        if (pf.https->responded && pf.https->version_anomaly)                                 ++https_bad_ver_ports;
+        else if (pf.https->responded && pf.https->server_hdr.empty())                         ++https_no_server_ports;
+        else if (!pf.https->responded)                                                        ++https_empty_ports;
+        else                                                                                  ++https_ok_real_ports;
+    }
 
     printf("\n  %sDPI exposure matrix:%s\n", col(C::BOLD), col(C::RST));
     // 1. Port-based (TSPU curated list)
@@ -2320,33 +3253,49 @@ static FullReport run_full_target(const string& target) {
         }
     }
     // 4. ASN classifier
+    //    v2.3: hosting ASN is the NORM for public servers. TSPU does look
+    //    at ASN class, but on its own it only enables further checks — it
+    //    is not a positive VPN verdict. Downgrade from MEDIUM to LOW/NONE.
     {
-        if (hosting_hits >= 2)   axis("ASN classifier (VPS/hosting)", "MEDIUM",
-                                      std::to_string(hosting_hits) + " sources flag hosting/datacenter ASN");
+        if (hosting_hits >= 2)   axis("ASN classifier (VPS/hosting)", "LOW",
+                                      std::to_string(hosting_hits) + " sources classify the ASN as hosting/datacenter — normal for any public server");
         else if (hosting_hits == 1) axis("ASN classifier (VPS/hosting)", "LOW",
-                                         "1 source flags hosting ASN (ambiguous)");
+                                         "1 source classifies the ASN as hosting (ambiguous)");
         else                     axis("ASN classifier (VPS/hosting)", "NONE",
                                       "no GeoIP source classifies the ASN as hosting");
     }
     // 5. VPN/Proxy tags from threat-intel
+    //    v2.3: single-source tag is noise. Only multi-source consensus is
+    //    a real signal.
     {
-        if (vpn_hits >= 2 || proxy_hits >= 2 || tor_hits) {
-            string note = std::to_string(vpn_hits) + " VPN / " + std::to_string(proxy_hits) +
-                          " proxy / " + std::to_string(tor_hits) + " Tor tags";
-            axis("Threat-intel tags (VPN/Proxy/Tor)", "HIGH", note);
+        if (tor_hits) {
+            axis("Threat-intel tags (VPN/Proxy/Tor)", "HIGH",
+                 std::to_string(tor_hits) + " sources tag this IP as Tor exit");
+        } else if (vpn_hits >= 2 || proxy_hits >= 2) {
+            string n = std::to_string(vpn_hits) + " VPN / " + std::to_string(proxy_hits) + " proxy tags";
+            axis("Threat-intel tags (VPN/Proxy/Tor)", "HIGH", n);
         } else if (vpn_hits || proxy_hits) {
-            axis("Threat-intel tags (VPN/Proxy/Tor)", "LOW", "single-source tag (weak)");
+            axis("Threat-intel tags (VPN/Proxy/Tor)", "NONE",
+                 "1 single-source tag — false-positive rate too high to count");
         } else {
             axis("Threat-intel tags (VPN/Proxy/Tor)", "NONE", "no VPN/Proxy/Tor tag from any source");
         }
     }
-    // 6. Cert freshness
+    // 6. Cert freshness + short-validity (v2.3)
+    //    short-validity (< 14d total) is NEVER legitimate — LE issues 90d,
+    //    commercial CAs issue 30-365d. A 6-day cert is a hand-rolled
+    //    short-lived self-signed or a test-CA cert typical of Xray/Trojan
+    //    quickfire installs.
     {
-        if (cert_fresh_ports >= 1) axis("Cert freshness (new-LE watch)", "MEDIUM",
-                                         std::to_string(cert_fresh_ports) +
-                                         " port(s) with cert <14d old");
-        else                      axis("Cert freshness (new-LE watch)", "LOW",
-                                       "no suspiciously fresh certs");
+        if (cert_short_validity_ports >= 1)
+            axis("Cert freshness (new-LE watch)", "HIGH",
+                 std::to_string(cert_short_validity_ports) +
+                 " port(s) with impossibly short cert validity (<14d total — real CAs never issue this)");
+        else if (cert_fresh_ports >= 1)
+            axis("Cert freshness (new-LE watch)", "MEDIUM",
+                 std::to_string(cert_fresh_ports) + " port(s) with cert <14d old");
+        else
+            axis("Cert freshness (new-LE watch)", "LOW", "no suspiciously fresh certs");
     }
     // 7. Active junk probing (J3)
     {
@@ -2363,17 +3312,25 @@ static FullReport run_full_target(const string& target) {
                  std::to_string(j3_silent_total) + " silent / " + std::to_string(j3_resp_total) + " resp");
     }
     // 8. Open-port profile
+    //    v2.3: single-port :443 is NOT a red flag on its own — many
+    //    corporate reverse-proxies / CDNs look identical. Downgrade.
+    //    v2.3: but if the sparse set is dominated by 3x-ui/x-ui/Marzban
+    //    panel preset ports, the open-port profile IS anomalous.
     {
         size_t np = R.open_tcp.size();
-        if (np == 1 && openset.count(443))
-            axis("Open-port profile (sparsity)", "MEDIUM",
-                 ":443 only — classic single-purpose reverse-proxy / Reality front");
+        if (xui_cluster_seen)
+            axis("Open-port profile (sparsity)", "HIGH",
+                 std::to_string(np) + " ports open, dominated by the 3x-ui/x-ui/Marzban preset TLS cluster " +
+                 std::to_string(xui_cluster_hits) + " hits (2053/2083/2087/2096/8443/…) — installer fingerprint");
+        else if (np == 1 && openset.count(443))
+            axis("Open-port profile (sparsity)", "LOW",
+                 ":443 only — common for reverse-proxies, corporate apps, and single-purpose hosts alike");
         else if (np <= 3 && openset.count(443) && hosting_hits)
             axis("Open-port profile (sparsity)", "LOW",
-                 "sparse (<=3 ports) on hosting ASN — VPS proxy profile");
+                 "sparse (<=3 ports) on hosting ASN — ambiguous (minimal corp server / proxy VPS)");
         else if (np >= 8)
-            axis("Open-port profile (sparsity)", "LOW",
-                 std::to_string(np) + " ports open — diverse service host, not a dedicated proxy");
+            axis("Open-port profile (sparsity)", "NONE",
+                 std::to_string(np) + " ports open — diverse service host, clearly not a dedicated proxy");
         else
             axis("Open-port profile (sparsity)", "LOW",
                  std::to_string(np) + " ports open");
@@ -2387,90 +3344,367 @@ static FullReport run_full_target(const string& target) {
         else if (any_tls)  axis("TLS hygiene (1.3 + h2 + trusted-CA)", "LOW", "TLS posture is clean (1.3 + h2 + trusted-CA)");
         else               axis("TLS hygiene (1.3 + h2 + trusted-CA)", "NONE", "no TLS observed");
     }
+    // 10. Cert impersonation (v2.3) — famous-brand CN on a non-owning ASN.
+    //     This is the cheapest tell for a Reality-static setup: someone
+    //     points `dest=www.amazon.com` (or Apple/Microsoft/Google/...) and
+    //     Reality clones that cert. ASN-to-brand ownership check rules out
+    //     legitimate CDN fronting.
+    {
+        if (any_impersonation) {
+            int cnt = 0; string bdom;
+            for (auto& pf: R.fps) if (pf.sni && pf.sni->cert_impersonation) {
+                ++cnt; if (bdom.empty()) bdom = pf.sni->brand_claimed;
+            }
+            // Also count server-header brand hits (independent channel).
+            int svr_cnt = 0;
+            for (auto& pf: R.fps)
+                if (pf.https && pf.https->tls_ok && !pf.https->server_hdr.empty()) {
+                    string sb = server_header_brand(pf.https->server_hdr);
+                    if (!sb.empty() && !asn_owns_brand(sb, asn_orgs_all)) {
+                        ++svr_cnt; if (bdom.empty()) bdom = sb;
+                    }
+                }
+            string detail = std::to_string(cnt) + " cert port(s)";
+            if (svr_cnt > 0) detail += " + " + std::to_string(svr_cnt) + " Server-header port(s)";
+            detail += " claim brand '" + bdom + "' on an ASN that does NOT own it — Reality `dest=` cloning signature";
+            axis("Cert impersonation (Reality-static tell)", "HIGH", detail);
+        } else {
+            axis("Cert impersonation (Reality-static tell)", "NONE",
+                 "no cert claims a major-brand domain the ASN doesn't own");
+        }
+    }
+    // 11. Active HTTP-over-TLS probe (v2.3) — after the TLS handshake we
+    //     actually send `GET / HTTP/1.1` and read the reply. Real web
+    //     origins always answer (200/301/404/502 with a Server: header).
+    //     Silence, missing Server, or a malformed HTTP version are the
+    //     hard tells for middleware / Xray fallback.
+    {
+        if (https_bad_ver_ports >= 1) {
+            axis("Active HTTP-over-TLS probe", "HIGH",
+                 std::to_string(https_bad_ver_ports) +
+                 " port(s) returned an invalid HTTP version (HTTP/0.0 or malformed) — no real web server emits this");
+        } else if (https_empty_ports >= 1) {
+            axis("Active HTTP-over-TLS probe", "MEDIUM",
+                 std::to_string(https_empty_ports) +
+                 " port(s) accept TLS but return 0 bytes to a valid GET / — stream-layer proxy tell");
+        } else if (https_no_server_ports >= 1) {
+            axis("Active HTTP-over-TLS probe", "MEDIUM",
+                 std::to_string(https_no_server_ports) +
+                 " port(s) responded without a Server: header — nginx/Apache/Caddy always set one");
+        } else if (https_ok_real_ports >= 1) {
+            axis("Active HTTP-over-TLS probe", "LOW",
+                 std::to_string(https_ok_real_ports) +
+                 " port(s) returned a well-formed HTTP reply with a Server: header — looks like a real web origin");
+        } else {
+            axis("Active HTTP-over-TLS probe", "NONE", "no TLS port to probe");
+        }
+    }
+    // 12. 3x-ui / x-ui / Marzban panel-port cluster (v2.3) — the panel
+    //     installers preset an exact TLS-port set that regular web hosts
+    //     almost never open together.
+    {
+        if (xui_cluster_hits >= 2)
+            axis("Panel-port cluster (3x-ui/x-ui/Marzban)", "HIGH",
+                 std::to_string(xui_cluster_hits) + " of the preset panel TLS ports are open "
+                 "(2053/2083/2087/2096/8443/8880/6443/7443/9443)");
+        else if (xui_cluster_hits == 1)
+            axis("Panel-port cluster (3x-ui/x-ui/Marzban)", "MEDIUM",
+                 "1 panel-preset TLS port open — ambiguous (could be Cloudflare-Origin anyway)");
+        else
+            axis("Panel-port cluster (3x-ui/x-ui/Marzban)", "NONE",
+                 "no panel-preset TLS ports among open set");
+    }
+    // 13. J3 canned-fallback / HTTP-anomaly aggregate (v2.3) — real web
+    //     servers vary their replies per request (different URIs, methods,
+    //     headers). An identical byte-exact reply to multiple distinct
+    //     probes is a static fallback page that Xray/Trojan wire up.
+    {
+        int worst = std::max({j3_canned_ports, j3_badver_ports, j3_raw_nonhttp_ports});
+        if (j3_canned_ports >= 1 || j3_badver_ports >= 1)
+            axis("J3 canned/anomaly aggregate", "HIGH",
+                 std::to_string(j3_canned_ports) + " canned / " +
+                 std::to_string(j3_badver_ports) + " bad-version / " +
+                 std::to_string(j3_raw_nonhttp_ports) + " raw-non-HTTP port(s) — static fallback signature");
+        else if (j3_raw_nonhttp_ports >= 1)
+            axis("J3 canned/anomaly aggregate", "MEDIUM",
+                 std::to_string(j3_raw_nonhttp_ports) + " port(s) return non-HTTP bytes — Shadowsocks/Trojan/custom proxy");
+        else if (j3_ports_checked)
+            axis("J3 canned/anomaly aggregate", "LOW", "no canned / bad-version / raw-non-HTTP replies");
+        else
+            axis("J3 canned/anomaly aggregate", "NONE", "no J3 probes ran");
+        (void)worst;
+    }
 
     // ---- Signal lists ----------------------------------------------
-    printf("\n  %sStrong signals (%zu):%s\n", col(C::BOLD), signals_major.size(), col(C::RST));
+    printf("\n  %sStrong signals (%zu)%s  [%s!%s = real evidence of VPN/proxy]\n",
+           col(C::BOLD), signals_major.size(), col(C::RST), col(C::RED), col(C::RST));
     if (signals_major.empty()) printf("    (none)\n");
     else for (auto& s: signals_major) printf("    %s[!]%s %s\n", col(C::RED), col(C::RST), s.c_str());
 
-    printf("\n  %sSoft signals (%zu):%s\n", col(C::BOLD), signals_minor.size(), col(C::RST));
+    printf("\n  %sSoft signals (%zu)%s  [%s-%s = suggestive pattern, not proof]\n",
+           col(C::BOLD), signals_minor.size(), col(C::RST), col(C::YEL), col(C::RST));
     if (signals_minor.empty()) printf("    (none)\n");
     else for (auto& s: signals_minor) printf("    %s[-]%s %s\n", col(C::YEL), col(C::RST), s.c_str());
+
+    printf("\n  %sInformational (%zu)%s  [%si%s = observation only, no penalty — normal sites can have these]\n",
+           col(C::BOLD), notes.size(), col(C::RST), col(C::CYN), col(C::RST));
+    if (notes.empty()) printf("    (none)\n");
+    else for (auto& [tag, s]: notes)
+        printf("    %s[i]%s %s%s%s  %s\n",
+               col(C::CYN), col(C::RST),
+               col(C::DIM), tag.c_str(), col(C::RST), s.c_str());
 
     printf("\n  %sFinal score:%s %s%d/100%s  verdict: %s%s%s\n",
            col(C::BOLD), col(C::RST), col(C::BOLD), score, col(C::RST),
            col(color), R.label.c_str(), col(C::RST));
 
-    // ---- Technical recommendations ----------------------------------
-    printf("\n  %sRecommendations:%s\n", col(C::BOLD), col(C::RST));
-    bool any_advice = false;
+    // ---- Hardening suggestions (actionable) ------------------------
+    // Built from strong/soft signals AND from informational observations —
+    // so every "[i] single-443" etc. comes with a concrete fix even
+    // though it didn't cost any score.
+    printf("\n  %sHardening suggestions:%s\n", col(C::BOLD), col(C::RST));
+    auto sug = [](const char* tag, const char* body) {
+        printf("    %s[%s]%s\n      %s\n", col(C::GRN), tag, col(C::RST), body);
+    };
 
+    bool any_sug = false;
+    auto has_note = [&](const string& t) {
+        for (auto& [k,_]: notes) if (k == t) return true;
+        return false;
+    };
+
+    // Protocol-level hardening
     if (xray_reality_primary && xray_reality_hidden) {
-        printf("    [!] Mixed Reality configuration: one port uses HTTP-fallback, another is hidden-mode.\n"
-               "        The hidden port exposes the silent-on-junk DPI signature. Either drop the duplicate\n"
-               "        listener or configure the Reality `fallback` block so it returns HTTP 400/502 on\n"
-               "        non-handshake traffic, matching nginx/Apache defaults.\n");
-        any_advice = true;
+        sug("reality-mixed",
+            "Mixed Reality config: one port uses HTTP-fallback, another is hidden-mode.\n"
+            "      The hidden port exposes the silent-on-junk DPI signature. Either drop\n"
+            "      the duplicate listener, or configure the Reality `fallback` block so\n"
+            "      EVERY port returns HTTP 400/502 on non-handshake traffic (match nginx).");
+        any_sug = true;
     } else if (xray_reality_hidden) {
-        printf("    [!] Reality is in hidden-mode: handshake ok, but HTTP/junk bytes are silently dropped.\n"
-               "        That 'silent-on-junk' pattern is DPI-detectable (TSPU/GFW already fingerprint it).\n"
-               "        Point `dest=` at a real HTTPS site you do NOT control and configure `fallback`\n"
-               "        so the server returns its 400/502 page on unrecognised bytes.\n");
-        any_advice = true;
+        sug("reality-hidden",
+            "Reality hidden-mode: TLS handshake ok, but non-TLS bytes are silently dropped.\n"
+            "      That pattern is DPI-detectable (TSPU/GFW fingerprint it).\n"
+            "      Fix: set `dest=` to a real HTTPS site you don't control, and configure\n"
+            "      `fallback` so the server returns its own 400/502 page on unrecognised bytes.");
+        any_sug = true;
     } else if (xray_reality_primary) {
-        printf("    [+] Reality HTTP-fallback is wired correctly: non-handshake bytes get an HTTP 400,\n"
-               "        which is indistinguishable from a vanilla nginx/Apache reverse-proxy. No action needed.\n");
-        any_advice = true;
+        sug("reality-ok",
+            "Reality HTTP-fallback is wired correctly: junk bytes get HTTP 400, which is\n"
+            "      indistinguishable from nginx/Apache. No action needed.");
+        any_sug = true;
+    }
+    if (proxy_middleware_seen) {
+        sug("proxy-middleware",
+            "TLS is clean on this port, but the origin silently drops every HTTP-junk probe\n"
+            "      instead of returning HTTP 400 like nginx/Apache/Caddy would. That silence\n"
+            "      is the proxy-middleware signature TSPU actively tests for. Fix: put a real\n"
+            "      nginx in front that handles both the TLS handshake AND the HTTP fallback,\n"
+            "      so non-TLS bytes hit nginx's own 400 page.");
+        any_sug = true;
     }
     if (reality_port_count >= 2) {
-        printf("    [-] Reality is listening on %d ports of the same IP. ASN/port sweeps will flag\n"
-               "        multi-port TLS-steering anomalies; keep Reality on a single port and populate\n"
-               "        the other ports with real services (or close them).\n", reality_port_count);
-        any_advice = true;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "Reality is listening on %d ports of the same IP. ASN/port sweeps flag multi-port\n"
+            "      TLS-steering anomalies; keep Reality on a single port and populate the\n"
+            "      other ports with real services (or close them).", reality_port_count);
+        sug("reality-multiport", buf);
+        any_sug = true;
     }
-    if (plain_tls_on_443 && !any_reality) {
-        printf("    [i] Port 443 serves a plain TLS origin with a single default cert: looks like any\n"
-               "        nginx/Apache/CDN origin — no VPN signature visible from outside.\n");
-        any_advice = true;
-    }
-    if (any_tls && !any_reality) {
-        // Neutral informational — no penalty was applied above.
-    }
-    if (openset.count(22)) {
-        printf("    [-] Close or rehome SSH/22: the open SSH banner is sufficient for any ASN aggregator\n"
-               "        to classify the host as VPS/server. Move it to a non-standard port AND\n"
-               "        firewall it to known admin source IPs.\n");
-        any_advice = true;
-    }
+
+    // Hardened-VPN-protocol hardening
     if (any_ovpn_udp || openset.count(1194) || openset.count(1193)) {
-        printf("    [!] OpenVPN on the default port 1194: TSPU/GFW drop this on the first HARD_RESET.\n"
-               "        Wrap in TLS (Cloak, stunnel, or migrate to VLESS+Reality on 443).\n");
-        any_advice = true;
+        sug("openvpn",
+            "OpenVPN on default port 1194: TSPU/GFW drop this on the first HARD_RESET.\n"
+            "      Wrap in TLS (stunnel / Cloak) or migrate to VLESS+Reality on :443.");
+        any_sug = true;
     }
     if (any_wg) {
-        printf("    [!] WireGuard on UDP/51820 answers its handshake: the handshake itself is a\n"
-               "        distinctive fixed-offset signature. Use amneziawg or put WireGuard behind\n"
-               "        a TCP-TLS tunnel if you need to survive active DPI.\n");
-        any_advice = true;
+        sug("wireguard",
+            "WireGuard on UDP/51820 answers its handshake — the handshake is a fixed-offset\n"
+            "      signature TSPU already has. Use amneziawg (obfuscated WG) or tunnel WG\n"
+            "      inside a TCP-TLS wrapper if you need to survive active DPI.");
+        any_sug = true;
     }
     if (openset.count(8388) || openset.count(8488)) {
-        printf("    [!] Shadowsocks on its default port is trivially probed via AEAD-length oracle.\n"
-               "        Wrap it with v2ray/xray stream settings + TLS, or drop it for VLESS+Reality.\n");
-        any_advice = true;
+        sug("shadowsocks",
+            "Shadowsocks on its default port is trivially probed via AEAD-length oracle.\n"
+            "      Wrap it with v2ray/xray stream-settings + TLS, or drop it for VLESS+Reality.");
+        any_sug = true;
     }
     if (openset.count(3389)) {
-        printf("    [!] RDP/3389 is reachable from the Internet: this is a critical attack surface.\n"
-               "        Firewall it immediately; expose it only through a VPN or jump host.\n");
-        any_advice = true;
+        sug("rdp",
+            "RDP/3389 is reachable from the Internet — not a VPN issue, but a critical\n"
+            "      attack surface. Firewall it; expose only through a jump host or VPN.");
+        any_sug = true;
     }
+
+    // --- v2.3 hardening ------------------------------------------------
+    if (any_impersonation) {
+        // Brand domain: prefer the TLS-cert brand if we caught it there,
+        // else fall back to the Server-header-derived brand.
+        string bdom;
+        for (auto& pf: R.fps)
+            if (pf.sni && pf.sni->cert_impersonation && !pf.sni->brand_claimed.empty()) {
+                bdom = pf.sni->brand_claimed; break;
+            }
+        if (bdom.empty())
+            for (auto& pf: R.fps)
+                if (pf.https && pf.https->tls_ok && !pf.https->server_hdr.empty()) {
+                    string sb = server_header_brand(pf.https->server_hdr);
+                    if (!sb.empty()) { bdom = sb; break; }
+                }
+        string body =
+            "Reality `dest=` points at '" + bdom + "', so the endpoint serves a cert (and/or\n"
+            "      `Server:` banner) for that brand on an ASN that doesn't own it. This is the\n"
+            "      cheapest tell in the book — DPI engines cross-reference cert subject + HTTP\n"
+            "      Server-header + ASN ownership. Pick a `dest=` on the SAME ASN/CDN as your VPS\n"
+            "      (e.g. a small regional site on the same hosting provider's netblock), or —\n"
+            "      safer — move to a real domain you own with its own full LE chain. Never pick\n"
+            "      amazon/apple/microsoft/google/cloudflare on a random VPS.";
+        sug("cert-impersonation", body.c_str());
+        any_sug = true;
+    }
+    if (cert_short_validity_ports > 0) {
+        sug("cert-short-validity",
+            "One of the certs has total validity < 14 days. Real CAs never issue that:\n"
+            "      Let's Encrypt = 90d, commercial = 30d+. A sub-14d cert is a hand-rolled\n"
+            "      short-lifetime self-signed or a test-CA issuance — classic Xray/Trojan\n"
+            "      quickfire setup. Fix: switch to LE (certbot / lego / acme.sh) with auto-renew,\n"
+            "      OR front the origin behind a CDN so visitors see the CDN's cert instead.");
+        any_sug = true;
+    }
+    if (j3_canned_ports > 0 || j3_badver_ports > 0) {
+        sug("canned-fallback",
+            "At least one port returns a canned fallback (same byte-exact first line for\n"
+            "      different probes) or a malformed HTTP version — classic Xray `fallback` /\n"
+            "      Trojan default handler. Real nginx/Apache/Caddy vary their replies per\n"
+            "      request (different URIs -> different statuses, different bodies). Fix:\n"
+            "      put a real nginx in front with a proper error-page map, and make the Xray\n"
+            "      `fallbacks` point at that nginx so non-handshake bytes get REAL HTTP.");
+        any_sug = true;
+    }
+    if (https_bad_ver_ports > 0) {
+        sug("http-version-anomaly",
+            "Active HTTP-over-TLS probe got back an invalid HTTP version (HTTP/0.0 or\n"
+            "      similar). No real web server emits that — it's generated by Xray/Trojan's\n"
+            "      stream handler when it partially decodes a non-protocol request. Same fix as\n"
+            "      above: wire the `fallback` block to a real nginx so it emits `HTTP/1.1 400`.");
+        any_sug = true;
+    }
+    if (https_empty_ports > 0 && !any_reality) {
+        sug("http-silent-origin",
+            "Active HTTP-over-TLS probe completed the handshake but got zero response bytes\n"
+            "      back to a plain `GET /`. A legitimate web origin always answers (200 / 301 /\n"
+            "      404 / 502). Silence is the stream-layer-proxy signature (Xray/Trojan/SS-AEAD\n"
+            "      that only speaks its own framing). Fix: add an HTTP `fallback` that proxies\n"
+            "      to a real web root so `GET /` always returns something with a `Server:` header.");
+        any_sug = true;
+    }
+    if (https_no_server_ports > 0 && !any_reality) {
+        sug("http-missing-server-header",
+            "The origin replies to HTTP but without a `Server:` header. nginx/Apache/Caddy/CDNs\n"
+            "      set one unambiguously. Absence is a middleware / custom-handler tell — fix by\n"
+            "      fronting the origin with a real nginx that sets `server_tokens on` (or even\n"
+            "      forges a plausible `Server: cloudflare` / `Server: nginx/1.24.0`).");
+        any_sug = true;
+    }
+    if (xui_cluster_seen) {
+        sug("xui-panel",
+            "The open-port profile matches the 3x-ui / x-ui / Marzban panel installer set\n"
+            "      (2053/2083/2087/2096/8443/8880/6443/7443/9443). That exact cluster is the\n"
+            "      single strongest fingerprint a TSPU-class DPI engine looks for. Fix: close\n"
+            "      the unused panel ports (keep ONE listener on :443 on the real Reality inbound),\n"
+            "      firewall the panel UI to admin source IPs only, and avoid the defaults.");
+        any_sug = true;
+    }
+
+    // TLS hygiene
     for (auto& pf: R.fps)
         if (pf.tls && pf.tls->ok && pf.tls->version != "TLSv1.3") {
-            printf("    [-] Upgrade TLS to 1.3 on :%d (current: %s). Modern Reality/VLESS requires 1.3.\n",
-                   pf.port, pf.tls->version.c_str());
-            any_advice = true;
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "Upgrade TLS to 1.3 on :%d (current: %s). Modern clients expect TLS 1.3;\n"
+                "      VLESS/Reality requires it. Bump the OpenSSL/nginx config.",
+                pf.port, pf.tls->version.c_str());
+            sug("tls-version", buf);
+            any_sug = true;
         }
-    if (!any_advice)
-        printf("    (none — no actionable red flags detected)\n");
+    if (cert_self_signed_ports > 0) {
+        sug("tls-self-signed",
+            "Self-signed TLS cert: browsers reject it instantly, and it is the classic\n"
+            "      Shadowsocks/Trojan/test-setup signature. Issue a real cert (Let's\n"
+            "      Encrypt on a real domain) or front the endpoint with a CDN.");
+        any_sug = true;
+    }
+
+    // Observation-driven hardening (from notes[])
+    if (has_note("single-443")) {
+        sug("port-profile",
+            "Only :443 is reachable. Not a red flag on its own — TSPU classifies by the\n"
+            "      bytes on the wire, not by how many ports you open. But if you want to\n"
+            "      look like a typical corporate web host, open :80 with a 301 HTTP→HTTPS\n"
+            "      redirect, serve a real-looking page on `/` (not the default nginx page),\n"
+            "      and optionally add a firewalled :22 or :25 so the host has 'context'.");
+        any_sug = true;
+    }
+    if (has_note("ssh-22")) {
+        sug("ssh-banner",
+            "SSH/22 is open with a default banner. It doesn't tag you as a VPN, but it\n"
+            "      does tell every ASN-sweep that you run a real server. Move SSH to a\n"
+            "      high port (40000+) and firewall it to known admin source IPs.");
+        any_sug = true;
+    }
+    if (cert_fresh_ports > 0 && sparse_vps_profile) {
+        sug("cert-fresh",
+            "Fresh cert (<14d) on a sparse-port hosting host is a classical 'new VLESS\n"
+            "      instance' fingerprint. Fix: use a long-lived wildcard cert on a domain\n"
+            "      you've owned >90d, or front the origin behind a CDN (Cloudflare free\n"
+            "      tier) so visitors see the CDN's cert instead of yours.");
+        any_sug = true;
+    } else if (has_note("cert-fresh")) {
+        sug("cert-fresh",
+            "Fresh cert (<14d) is normal LE rotation on its own. Only becomes a signal\n"
+            "      when combined with hosting-ASN + sparse port profile. No action needed\n"
+            "      unless you're also on a single-purpose VPS profile.");
+        any_sug = true;
+    }
+    if (has_note("asn-hosting") && !any_reality && !proxy_middleware_seen) {
+        sug("asn-hosting",
+            "Being on a hosting ASN is the norm for every public server — this alone is\n"
+            "      NOT a VPN signal. TSPU does use ASN as a gate for deeper checks, but\n"
+            "      what it then verifies is the TLS/HTTP behaviour, not the ASN itself.\n"
+            "      If you want to escape the 'hosting ASN' category entirely, the only\n"
+            "      clean move is a residential-ASN proxy in front (rare) or a CDN.");
+        any_sug = true;
+    }
+    if (has_note("geo-vpn") || has_note("geo-proxy")) {
+        sug("threat-intel",
+            "One of the 9 GeoIP providers (3 EU / 3 RU / 3 global) tagged this IP as\n"
+            "      VPN/proxy. Single-source tags are very noisy (false positives are common).\n"
+            "      Fix only if it blocks you in practice: rotate to a fresh IP, or if IP\n"
+            "      reputation really matters to your use-case, use an IP on a residential /\n"
+            "      business ASN instead of hosting.");
+        any_sug = true;
+    }
+
+    if (!any_sug)
+        printf("    (no actionable hardening — protocol posture looks clean)\n");
+
+    // ---- Threat-model note ------------------------------------------
+    printf("\n  %sThreat-model note:%s\n", col(C::BOLD), col(C::RST));
+    printf("    TSPU/GFW classify a destination by what the IP actually does on the wire —\n"
+           "    TLS handshake bytes, cert-steering, active HTTP-over-TLS reply shape,\n"
+           "    reactions to junk, default-port replies. IP 'reputation' (hosting ASN /\n"
+           "    GeoIP VPN tag) is only a coarse pre-filter, so this tool treats it as\n"
+           "    informational and focuses the score on the actual protocol signatures at\n"
+           "    the endpoint. v2.3 strong signals are: cert impersonation (brand CN on\n"
+           "    non-owning ASN), short-validity certs (<14d), canned-fallback pages,\n"
+           "    HTTP-version anomalies, and 3x-ui/x-ui/Marzban panel-port clusters — these\n"
+           "    are expensive-to-fake tells that map directly to Xray/Reality/Trojan.\n"
+           "    If every strong signal is 'none' and soft signals are quiet, the host is\n"
+           "    essentially invisible to passive DPI regardless of what the ASN looks like.\n");
 
     return R;
 }
@@ -2501,8 +3735,10 @@ static void help() {
     printf("  --udp-to MS     UDP recv timeout         (default 900)\n");
     printf("  --no-color      disable ANSI colors\n");
     printf("  -v / --verbose  verbose\n\n");
-    printf("GeoIP sources: ipapi.is, iplocate.io, ip-api.com, ipwho.is,\n");
-    printf("               ipinfo.io, freeipapi.com, 2ip.io (RU)\n");
+    printf("GeoIP sources (9 providers, 3 EU / 3 RU / 3 global):\n");
+    printf("  EU:     ipapi.is, iplocate.io, freeipapi.com\n");
+    printf("  RU:     2ip.io/2ip.me, ip-api.com/ru, sypexgeo.net\n");
+    printf("  global: ip-api.com, ipwho.is, ipinfo.io\n");
 }
 
 static void pause_for_enter() {
@@ -2619,16 +3855,21 @@ static void interactive() {
             pause_for_enter();
         } else if (c == '6') {
             string t = ask("  IP (blank = your IP): ");
-            auto f1 = std::async(std::launch::async, geo_ipapi_is,   t);
+            auto f1 = std::async(std::launch::async, geo_ipapi_is,   t);   // EU
             auto f2 = std::async(std::launch::async, geo_iplocate,   t);
-            auto f3 = std::async(std::launch::async, geo_ip_api_com, t);
-            auto f4 = std::async(std::launch::async, geo_ipwho_is,   t);
-            auto f5 = std::async(std::launch::async, geo_ipinfo_io,  t);
-            auto f6 = std::async(std::launch::async, geo_freeipapi,  t);
-            auto f7 = std::async(std::launch::async, geo_2ip_ru,     t);
+            auto f3 = std::async(std::launch::async, geo_freeipapi,  t);
+            auto f4 = std::async(std::launch::async, geo_2ip_ru,     t);   // RU
+            auto f5 = std::async(std::launch::async, geo_ipapi_ru,   t);
+            auto f6 = std::async(std::launch::async, geo_sypex,      t);
+            auto f7 = std::async(std::launch::async, geo_ip_api_com, t);   // global
+            auto f8 = std::async(std::launch::async, geo_ipwho_is,   t);
+            auto f9 = std::async(std::launch::async, geo_ipinfo_io,  t);
+            printf("  %s-- EU --%s\n", col(C::BOLD), col(C::RST));
             print_geo(f1.get()); print_geo(f2.get()); print_geo(f3.get());
+            printf("  %s-- RU --%s\n", col(C::BOLD), col(C::RST));
             print_geo(f4.get()); print_geo(f5.get()); print_geo(f6.get());
-            print_geo(f7.get());
+            printf("  %s-- global --%s\n", col(C::BOLD), col(C::RST));
+            print_geo(f7.get()); print_geo(f8.get()); print_geo(f9.get());
             pause_for_enter();
         } else if (c == '7') {
             run_local_analysis();
@@ -2749,16 +3990,21 @@ int main(int argc, char** argv) {
                     p.responded ? printable_prefix(p.first_line,60).c_str() : "(dropped)");
         } else if (cmd == "geoip") {
             string ip = pos.size()>=2 ? pos[1] : "";
-            auto f1 = std::async(std::launch::async, geo_ipapi_is,   ip);
+            auto f1 = std::async(std::launch::async, geo_ipapi_is,   ip);   // EU
             auto f2 = std::async(std::launch::async, geo_iplocate,   ip);
-            auto f3 = std::async(std::launch::async, geo_ip_api_com, ip);
-            auto f4 = std::async(std::launch::async, geo_ipwho_is,   ip);
-            auto f5 = std::async(std::launch::async, geo_ipinfo_io,  ip);
-            auto f6 = std::async(std::launch::async, geo_freeipapi,  ip);
-            auto f7 = std::async(std::launch::async, geo_2ip_ru,     ip);
+            auto f3 = std::async(std::launch::async, geo_freeipapi,  ip);
+            auto f4 = std::async(std::launch::async, geo_2ip_ru,     ip);   // RU
+            auto f5 = std::async(std::launch::async, geo_ipapi_ru,   ip);
+            auto f6 = std::async(std::launch::async, geo_sypex,      ip);
+            auto f7 = std::async(std::launch::async, geo_ip_api_com, ip);   // global
+            auto f8 = std::async(std::launch::async, geo_ipwho_is,   ip);
+            auto f9 = std::async(std::launch::async, geo_ipinfo_io,  ip);
+            printf("  %s-- EU --%s\n", col(C::BOLD), col(C::RST));
             print_geo(f1.get()); print_geo(f2.get()); print_geo(f3.get());
+            printf("  %s-- RU --%s\n", col(C::BOLD), col(C::RST));
             print_geo(f4.get()); print_geo(f5.get()); print_geo(f6.get());
-            print_geo(f7.get());
+            printf("  %s-- global --%s\n", col(C::BOLD), col(C::RST));
+            print_geo(f7.get()); print_geo(f8.get()); print_geo(f9.get());
         } else if (cmd == "local" || cmd == "me" || cmd == "self") {
             run_local_analysis();
         } else if (cmd == "help" || cmd == "--help") {
