@@ -1,5 +1,259 @@
 # Changelog
 
+## v2.4 — 2026-04-19
+
+v2.4 brings the full Russian ТСПУ methodology under one roof. The prior
+v2.3 covered the on-the-wire behaviour (cert impersonation, canned
+fallback, J3 probing, HTTP-over-TLS audit); v2.4 adds everything the
+official OCR methodika (§5-10) also calls out as canonical VPN tells but
+that v2.3 didn't yet implement:
+
+* **SNITCH-style latency analysis (§10.1)**
+* **HTTP proxy-chain header leakage (§10.2)**
+* **Certificate Transparency (crt.sh) absence**
+* **Modern 2026 tunnels — AmneziaWG / Hysteria2 / TUIC v5 / L2TP / SSTP**
+* **Traceroute hop-count anomaly (ICMP, userland)**
+* **TSPU / ТСПУ emulation verdict — explicit Russian-DPI ruling**
+* **Extended brand table — Yandex/VK/Tinkoff/Sber/Telegram/Discord/…**
+
+Pipeline grows from 7 phases to 8 (phase 7 = SNITCH+trace+SSTP). The
+verdict now ends with a Russian-DPI-style 3-tier block/throttle/allow
+ruling that mirrors what TSPU actually does on production lines.
+
+### New — phase `[7/8] SNITCH + traceroute + SSTP`
+
+A whole new pipeline stage between J3 probing and the verdict engine.
+Three independent measurements, all userland (no admin needed).
+
+#### 1. SNITCH latency-vs-geo consistency (methodika §10.1)
+
+Methodika §10.1 literally names SNITCH (Server-side Non-intrusive
+Identification of Tunnelled Characteristics) as the canonical "latency
+vs GeoIP" VPN detector. Until now the tool had no counterpart.
+
+v2.4 implements a simplified single-observer version:
+
+* Six TCP handshakes to the target on :443 (or first open port),
+  outlier-trimmed, median / min / max / stddev computed.
+* Three **anchor** RTT batches in parallel: 1.1.1.1 (Cloudflare
+  anycast), 8.8.8.8 (Google anycast), 77.88.8.8 (Yandex). Anchors give
+  a vantage-point baseline independent of which continent the user sits
+  on.
+* Country-code → physical RTT-minimum table for ~46 countries. Based
+  on fibre-speed-of-light: Moscow→Frankfurt ≈ 2000km one-way = ~10ms
+  one-way = ~20ms RTT floor. Table is calibrated for a typical RU/EU
+  observer.
+* Three anomaly tests:
+  * `too_low`  — median < 50% of the physical minimum for the claimed
+    country → **GeoIP lies** OR anycast proxy
+  * `too_high` — median > 3x the expected max → **extra hops in path**
+    (tunnel / long middlebox chain)
+  * `high_jitter` — stddev > 40ms → typical of tunnel queue/encryption
+    overhead
+  * `anchor_ratio_off` — target_RTT / closest_anchor ratio doesn't
+    match what the claimed geolocation would produce
+
+Each anomaly gets its own signal (major for `too_low`, minor for the
+others) and maps to a specific ТСПУ B-tier rule in the final verdict.
+The classic detectable case is a Cloudflare-fronted VPN showing as
+"country=US" with RTT=14ms to a Moscow observer — physically impossible
+without anycast.
+
+#### 2. Traceroute hop-count analysis
+
+Windows `IcmpSendEcho2` with TTL sweep 1..18, no raw sockets, no admin.
+Tracks:
+
+* `hop_count` — number of replying hops (≥20 flags as anomalous)
+* `max_rtt_jump_ms` — biggest RTT delta between consecutive hops
+  (tunnel endpoints show as big jumps)
+* `long_hops` — count of hops > 150ms (overlays / intercontinental
+  tunnels)
+
+Informational by default; fires as a minor signal only at ≥20 hops or
+on suspicious jump-pattern combinations.
+
+#### 3. SSTP probe (TCP/443 TLS-wrapped)
+
+Microsoft Secure Socket Tunneling Protocol is a VPN that runs over
+HTTPS on :443. Handshake is `SSTP_DUPLEX_POST /sra_{BA195980-CD49-458b-...}/`
+with the magic `Content-Length: 18446744073709551615` header (2⁶⁴-1).
+A real SSTP server replies `HTTP/1.1 200 OK` with the same magic length.
+
+Hard signal (-18 to score) on positive match — SSTP is old enough that
+every DPI engine has a dedicated ruleset for it.
+
+#### 4. JA3 advisory
+
+Reports the tool's own OpenSSL ClientHello JA3 hash so the user
+understands what fingerprint the target saw. Notes whether the target
+appeared to accept our non-Chrome JA3 (Reality servers in uTLS-enforcing
+mode would reject OpenSSL-default CH at the handshake layer).
+
+### New — phase 4 extras: Hysteria2 / TUIC / L2TP / AmneziaWG
+
+The classic VPN-protocol probe set (OpenVPN / WireGuard / IKE / QUIC /
+Tailscale / DNS) is extended with the modern 2026-standard tunnels:
+
+| Port     | Protocol                        | Detection payload |
+|----------|---------------------------------|-------------------|
+| UDP/1701 | L2TP control (SCCRQ)            | Full SCCRQ with mandatory AVPs (message type / protocol version / framing caps / host name / tunnel id) |
+| UDP/36712| Hysteria2 (QUIC-based)          | QUIC v1 Initial with custom DCID — vanilla QUIC version-neg differs from Hysteria's salamander-obfuscated handshake |
+| UDP/8443 | TUIC v5                         | QUIC Initial |
+| UDP/55555| AmneziaWG Sx=8                  | 8-byte random prefix + valid WG MessageInitiation payload |
+| UDP/51820| AmneziaWG on default WG port    | Distinguishes vanilla-WG vs AmneziaWG by two-probe comparison (vanilla rejected, Sx=8 accepted) |
+
+Each responding probe maps to a named protocol in the TSPU ruleset with
+its own penalty and hardening suggestion.
+
+### New — Certificate Transparency (crt.sh) lookup
+
+Real public certs (Let's Encrypt, ZeroSSL, any commercial CA) are
+required by RFC 9162 to be submitted to CT logs — enforced by Chrome
+and Firefox since 2018. A cert SHA-256 that returns `[]` from
+`https://crt.sh/?q=<sha256>&output=json` was never logged = it's
+either:
+
+* Self-signed (private CA) — never reached a public CA
+* Internal corporate test-CA issuance
+* LE-staging (intentionally unlogged)
+* Hand-rolled clone (copied bytes lose the original CT entry because
+  the SHA-256 changes) — classic Xray `dest=` cloning artefact
+
+v2.4 queries crt.sh for every TLS cert we see. CT-absence is:
+
+* **HIGH** signal (-15) when combined with cert-age < 30d
+* **MEDIUM** signal (-6) on its own (internal corp certs are a
+  legitimate non-CT case)
+
+### New — HTTP proxy-chain header leakage (methodika §10.2)
+
+Methodika §10.2 names `Via`, `Forwarded`, and `X-Forwarded-For` as
+diagnostic markers: if the origin sets them, a middle proxy is in path.
+
+v2.4 extends `https_probe()` to parse **fifteen** proxy-relevant
+headers across every TLS response:
+
+* Proxy leak: `Via` / `Forwarded` / `X-Forwarded-For` / `X-Real-IP` /
+  `X-Forwarded-Proto` / `X-Forwarded-Host`
+* CDN markers: `CF-Ray` / `CF-Cache-Status` (Cloudflare),
+  `X-Amz-Cf-Id` / `X-Amz-Cf-Pop` (CloudFront), `X-Azure-Ref` /
+  `X-Azure-ClientIP` (Azure AFD), `X-Cache` / `X-Served-By` (Fastly)
+* `Alt-Svc` (QUIC endpoint advertisement)
+
+Classification:
+
+* `has_proxy_leak = true` + non-CDN ASN  → **-12 major** signal, maps
+  to methodika §10.2 directly
+* `has_cdn_hdr = true` → informational only (CDN doing its job)
+* `Alt-Svc` set → noted for QUIC-endpoint detection
+
+### New — ТСПУ / TSPU emulation verdict block
+
+The verdict section now ends with a **dedicated Russian-DPI classifier
+emulation** that grades this host as a real TSPU middlebox would. It's
+a 3-tier ruling with rule-hit transparency:
+
+| Tier | Verdict          | What it means                                               |
+|------|------------------|-------------------------------------------------------------|
+| A    | IMMEDIATE BLOCK  | Named VPN/proxy signature matched — SYN/handshake drop       |
+| B≥2  | BLOCK            | ≥2 soft anomalies — accumulative classifier trips block      |
+| B=1  | THROTTLE / QoS   | 1 soft anomaly — flagged for monitoring / rate-limit         |
+| 0    | PASS / ALLOW     | No signatures — traffic passes unhindered                    |
+
+A-tier (protocol-level signatures):
+
+* OpenVPN wire signature (UDP/1194 HARD_RESET reply)
+* WireGuard wire signature (UDP/51820 handshake reply)
+* AmneziaWG obfuscation (Sx=8 accepted)
+* Hysteria2 default port (UDP/36712 live)
+* L2TP SCCRQ reply (UDP/1701)
+* IKE responder (UDP/500 or 4500)
+* SSTP VPN (TLS-wrapped on :443)
+* Shadowsocks default port (TCP/8388, 8488)
+* Open SOCKS5 proxy
+
+B-tier (accumulative soft anomalies):
+
+* Reality / XTLS cert-steering
+* Cert impersonation (brand CN on non-owning ASN)
+* 3x-ui / x-ui / Marzban panel-installer port cluster
+* Canned-fallback page or HTTP/0.0 malformed version
+* Short-validity cert (<14d)
+* HTTP proxy-chain leak (Via / Forwarded / X-Forwarded-For)
+* CT-log absence on fresh cert
+* SNITCH geo-latency conflict (§10.1)
+* Multi-source VPN/proxy threat-intel tag
+* Tor exit relay
+
+The block prints:
+
+* The 3-tier verdict
+* Every triggered A-tier and B-tier rule with its reason
+* **"What the operator sees"** — a plain-English description of how
+  the TSPU ruling manifests on the wire for end users (drop vs
+  throttle vs log vs pass)
+
+### Extended — brand table (27 → 94 entries)
+
+Added Russian-context brands for cert-impersonation detection:
+
+* **RU tech**: yandex, mail.ru, vk, ok.ru, avito, ozon, wildberries,
+  kinopoisk, rutube, dzen, habr, rambler, ya.ru
+* **RU banks + state**: sberbank, tinkoff/tbank, vtb, alfabank,
+  gazprombank, rosbank, gosuslugi, mos.ru, rt.ru (Rostelecom),
+  nalog.gov.ru
+* **RU telecom**: mts, megafon, beeline, rostelecom, tele2
+* **Messengers**: telegram/t.me, discord, slack, zoom, signal, threads
+* **Tech expansion**: icloud, googleapis, gitlab, bitbucket, outlook,
+  office365, azure, onedrive, tiktok, messenger
+* **Finance / SaaS**: stripe, paypal, shopify, adobe, salesforce,
+  dropbox
+* **Media / gaming**: spotify, twitch, vimeo, reddit, steam*,
+  playstation, xbox, nintendo, epicgames, battle.net
+
+Any TLS cert on a public IP claiming `CN=tinkoff.ru` or `CN=vk.com`
+etc. will now trigger cert-impersonation on an ASN that isn't
+registered to that brand — matching the Reality `dest=` tactic
+operators use to hide behind Russian-friendly names.
+
+### New — CLI sub-commands `snitch` and `trace`
+
+Standalone invocations for the two new measurement tools:
+
+```bash
+byebyevpn snitch my.vpn.server 443    # RTT/GeoIP consistency check only
+byebyevpn trace  my.vpn.server        # hop-count trace only
+```
+
+Interactive menu grows to 10 options (adds [8] SNITCH and [9]
+Traceroute).
+
+### Score calibration additions
+
+New penalties (added to v2.3 table):
+
+* SSTP detected: **-18** (protocol-level signature)
+* AmneziaWG on UDP/55555: **-15**
+* AmneziaWG on UDP/51820 (vanilla-WG rejected, Sx=8 accepted): **-16**
+* Hysteria2 on UDP/36712: **-15**
+* L2TP SCCRQ reply on UDP/1701: **-15**
+* TUIC v5 on UDP/8443: **-7**
+* HTTP proxy-chain leak (Via/Forwarded/XFF): **-12** per port
+* Certificate Transparency absence + fresh cert: **-15** per port
+* CT absence alone: **-6** per port
+* SNITCH `too_low` (impossible latency for GeoIP): **-15**
+* SNITCH `too_high` (extra hops): **-6**
+* Traceroute > 20 hops: **-5**
+
+### Build
+
+All additions are pure userland — no raw sockets, no admin, no new
+external dependencies. `IcmpSendEcho2` is in `iphlpapi` which was
+already linked; everything else is pure C++ / OpenSSL / WinHTTP.
+
+Build command is unchanged from v2.3.
+
 ## v2.3 — 2026-04-19
 
 v2.3 is a ground-up rework of the verdict engine in two movements:
